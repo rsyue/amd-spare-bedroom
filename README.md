@@ -6,6 +6,8 @@ Emulate multiple AMD GPU devices and distributed ranks (DDP, FSDP) with isolated
 
 ## Overview
 
+This repo positions itself as a playground for parallelism techniques for those who might have more VRAM than they need for a given workflow. Think of a [spare bedroom](https://advancedhouseplans.com/blogs/the-best-things-to-do-with-your-spare-bedroom) you might have in your house. If no one's using it, you could put a home office, gym or art studio in there. Well this repo is kind of like that. Except the goal is to experiment with different virtual devices in lockstep across the unified VRAM you have to spare.
+
 Modern unified-memory APUs—such as the **AMD Ryzen AI Max+ 395 with Radeon 8060S (`gfx_1151`)**—provide massive VRAM allocations (up to **96 GB** or **128 GB** visible via `amdgpu_top` and `rocm-smi`). 
 
 While this hardware typically appears to the operating system as a single monolithic GPU (`cuda:0` / `hip:0`), 96 GB is more than enough memory to host entire multi-node distributed training topologies.
@@ -116,3 +118,10 @@ A credential-free GitHub Actions workflow is configured in [`.github/workflows/c
 - Ruff linting and formatting verification.
 - Mypy strict type checking across `src/` and `tests/`.
 - Pytest suite on CPU / mocked virtual grids (GPU tests marked with `@pytest.mark.gpu` are skipped in standard CI runners).
+
+---
+
+## Author
+
+Created by [Richard Yue](https://github.com/rsyue) ([@rsyue](https://github.com/rsyue)).
+
