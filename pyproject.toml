@@ -72,6 +72,11 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_calls = false
+
+
 [tool.uv]
 default-groups = ["dev"]
 prerelease = "allow"
