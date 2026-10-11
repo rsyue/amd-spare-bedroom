@@ -136,7 +136,11 @@ class VirtualFSDP[ModelT: nn.Module]:
         return self._exec_replicas[rank](*args, **kwargs)
 
     def sync_gradients(self) -> None:
-        """Reduce-Scatter full gradients back into each rank's owned parameter shard."""
+        """Reduce-Scatter full gradients back into each rank's owned parameter shard.
+
+        Sanitizes non-finite gradients (NaN/Inf) prior to reduction to ensure
+        numerical stability across sharded ranks.
+        """
         for name, meta in self.metadata.items():
             # Check if gradient exists
             p0 = dict(self._exec_replicas[self.grid.ranks[0]].named_parameters())[name]
@@ -149,6 +153,7 @@ class VirtualFSDP[ModelT: nn.Module]:
                 if p_rank.grad is None:
                     raise RuntimeError(f"Gradient missing on rank {rank} for parameter '{name}'")
 
+                p_rank.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
                 flat_grad = p_rank.grad.view(-1)
                 if meta.padding_len > 0:
                     pad = torch.zeros(

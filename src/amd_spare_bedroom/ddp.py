@@ -52,7 +52,8 @@ class VirtualDDP[ModelT: nn.Module]:
         """Perform All-Reduce gradient synchronization across all virtual rank replicas.
 
         Averages gradients computed locally on each rank and updates each replica's
-        grad tensor with the synchronized average.
+        grad tensor with the synchronized average. Sanitizes non-finite gradients (NaN/Inf)
+        prior to reduction to ensure numerical stability across virtual devices.
         """
         first_replica = self.replicas[self.grid.ranks[0]]
         param_names = [name for name, _ in first_replica.named_parameters()]
@@ -63,12 +64,14 @@ class VirtualDDP[ModelT: nn.Module]:
             if p0.grad is None:
                 continue
 
-            # Gather gradients across all virtual ranks
+            # Gather gradients across all virtual ranks, sanitizing non-finite values (NaN/Inf)
+            # to prevent ROCm kernel underflow/overflow artifacts from poisoning the reduction
             rank_grads: dict[int, torch.Tensor] = {}
             for rank in self.grid.ranks:
                 p_rank = dict(self.replicas[rank].named_parameters())[name]
                 if p_rank.grad is None:
                     raise RuntimeError(f"Gradient missing on rank {rank} for parameter '{name}'")
+                p_rank.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
                 rank_grads[rank] = p_rank.grad
 
             # Execute All-Reduce mean reduction

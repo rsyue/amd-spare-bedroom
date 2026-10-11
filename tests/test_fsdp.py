@@ -150,3 +150,35 @@ def test_fsdp_mathematical_equivalence_to_ddp() -> None:
     for name, p_ddp in ddp_replica_0.named_parameters():
         p_fsdp = fsdp_full_weights[name]
         assert torch.allclose(p_fsdp, p_ddp.data, atol=1e-6)
+
+
+def test_virtual_fsdp_gradient_sanitization_non_finite() -> None:
+    """Verify that non-finite gradients (inf / nan) are safely sanitized during Reduce-Scatter."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=8.0, device_type="cpu")
+    model = SimpleLinear()
+    fsdp = VirtualFSDP(model, grid=grid)
+
+    # Forward on rank 0
+    out0 = fsdp.forward(rank=0, x=torch.ones((2, 8)))
+    loss0 = out0.sum()
+    loss0.backward()
+
+    # Forward on rank 1
+    out1 = fsdp.forward(rank=1, x=torch.ones((2, 8)))
+    loss1 = out1.sum()
+    loss1.backward()
+
+    # Inject inf and nan into rank 1 gradients
+    p1 = dict(fsdp._exec_replicas[1].named_parameters())["fc.weight"]
+    assert p1.grad is not None
+    p1.grad[0, 0] = float("-inf")
+    p1.grad[0, 1] = float("nan")
+
+    # Gradient sync must succeed and shards must have finite values
+    fsdp.sync_gradients()
+
+    for rank in grid.ranks:
+        for shard_param in fsdp.get_sharded_parameters(rank):
+            assert shard_param.grad is not None
+            assert not torch.isnan(shard_param.grad).any()
+            assert not torch.isinf(shard_param.grad).any()

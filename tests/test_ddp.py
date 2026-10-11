@@ -123,3 +123,36 @@ def test_virtual_ddp_mathematical_equivalence_to_full_batch() -> None:
     full_grad = full_batch_model.fc.weight.grad
     assert ddp_grad is not None and full_grad is not None
     assert torch.allclose(ddp_grad, full_grad, atol=1e-6)
+
+
+def test_virtual_ddp_gradient_sanitization_non_finite() -> None:
+    """Verify that non-finite gradients (inf / nan) are safely sanitized during All-Reduce."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=8.0, device_type="cpu")
+    model = SimpleModel()
+    ddp: VirtualDDP[SimpleModel] = VirtualDDP(model, grid=grid)
+
+    # Simulate forward/backward on rank 0 with valid grad
+    out0 = ddp.forward(rank=0, x=torch.ones((1, 4)))
+    loss0 = out0.sum()
+    loss0.backward()
+
+    # Simulate forward/backward on rank 1 with valid grad
+    out1 = ddp.forward(rank=1, x=torch.ones((1, 4)))
+    loss1 = out1.sum()
+    loss1.backward()
+
+    # Inject inf and nan into rank 1 gradients
+    p1 = ddp.get_replica(1).fc.weight
+    assert p1.grad is not None
+    p1.grad[0, 0] = float("-inf")
+    p1.grad[0, 1] = float("nan")
+
+    # Gradient sync must succeed without crashing or propagating NaNs/Infs
+    ddp.sync_gradients()
+
+    grad0 = ddp.get_replica(0).fc.weight.grad
+    grad1 = ddp.get_replica(1).fc.weight.grad
+    assert grad0 is not None and grad1 is not None
+    assert not torch.isnan(grad0).any()
+    assert not torch.isinf(grad0).any()
+    assert torch.allclose(grad0, grad1)

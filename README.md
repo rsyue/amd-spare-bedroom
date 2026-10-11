@@ -67,7 +67,7 @@ source .venv/bin/activate
 
 ### 2. Install Dependencies
 
-The project is pre-configured in [`pyproject.toml`](file:///home/rtotheich/amd-spare-bedroom/pyproject.toml) with the official AMD ROCm nightly index for `gfx1151` (`https://rocm.nightlies.amd.com/v2/gfx1151`). Simply sync the environment:
+The project is pre-configured in [`pyproject.toml`](pyproject.toml) with the official AMD ROCm nightly index for `gfx1151` (`https://rocm.nightlies.amd.com/v2/gfx1151`). Simply sync the environment:
 
 ```bash
 uv sync --extra dev
@@ -83,33 +83,54 @@ uv pip install --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151 torch
 
 ## Running Examples
 
-An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](file:///home/rtotheich/amd-spare-bedroom/examples/train_bert_glue.py), supporting both **FSDP** (parameter sharded) and **DDP** (replicated):
+An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](examples/train_bert_glue.py), supporting both **FSDP** (parameter sharded) and **DDP** (replicated) on actual GLUE benchmarks or fast in-memory synthetic datasets:
 
 ```bash
-# Run with VirtualFSDP (sharded parameters cutting per-rank memory to 25%):
+# Run with actual GLUE (MRPC) across 4 virtual ranks using VirtualFSDP:
 ./hooks/run examples/train_bert_glue.py --parallelism fsdp --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
 
 # Run with VirtualDDP (replicated model with All-Reduce gradient synchronization):
 ./hooks/run examples/train_bert_glue.py --parallelism ddp --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
 
-# Full BERT-base sequence classification across 8 virtual ranks with FSDP:
-./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3
+# Fast smoke test using synthetic dataset (no network/download required):
+./hooks/run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
+
+# Full BERT-base sequence classification across 8 virtual ranks with FSDP on SST-2:
+./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3 --task-name sst2
 ```
+
+Key CLI options:
+- `--parallelism`: Distributed mode (`fsdp` for sharded memory, `ddp` for replicated; default: `fsdp`).
+- `--synthetic` / `--use-synthetic`: Use fast in-memory synthetic dataset instead of downloading GLUE.
+- `--task-name` / `--task`: GLUE task (`mrpc`, `sst2`, `cola`, `qqp`, `mnli`, `qnli`, `rte`, `wnli`, `stsb`; default: `mrpc`).
+- `--dataset-size`: Sample cap (default: full dataset for GLUE, 64 for synthetic).
+- `--max-seq-length` / `--seq-len`: Maximum sequence length (default: 128).
+- `--max-steps`: Maximum training steps per epoch (`<= 0` for full epoch; default: 5).
+- `--epochs`: Number of training epochs (default: 2).
+- `--batch-size`: Per-rank batch size (default: 8).
+- `--lr`: Optimizer learning rate (default: 2e-5).
+- `--max-grad-norm`: Maximum gradient norm threshold for clipping (default: 1.0).
+- `--ranks`: Number of virtual devices/ranks to emulate in the grid (default: 4).
+- `--total-vram-gb`: Physical VRAM memory pool allocation in GB (default: 96.0).
+- `--device`: Target device type (`cuda`, `cpu`, or auto-detected; default: auto-detect).
+- `--model-name`: HuggingFace model identifier (default: `bert-base-uncased`).
+- `--use-tiny-bert`: Use compact 2-layer BERT for fast local verification.
+- `--seed`: Random seed for data shuffling and sampling (default: 42).
 
 ---
 
 ## Hook Scripts
 
-The repository includes a set of lightweight wrapper scripts in [`hooks/`](file:///home/rtotheich/amd-spare-bedroom/hooks) that execute commands through `uv run`:
+The repository includes a set of lightweight wrapper scripts in [`hooks/`](hooks/) that execute commands through `uv run`:
 
 | Script | Command | Purpose |
 | :--- | :--- | :--- |
-| [`hooks/run`](file:///home/rtotheich/amd-spare-bedroom/hooks/run) | `uv run python "$@"` | Run any Python script with the environment active |
-| [`hooks/lint`](file:///home/rtotheich/amd-spare-bedroom/hooks/lint) | `uv run ruff check "$@"` | Run Ruff linter checks |
-| [`hooks/format`](file:///home/rtotheich/amd-spare-bedroom/hooks/format) | `uv run ruff format "$@"` | Run Ruff code formatter |
-| [`hooks/typecheck`](file:///home/rtotheich/amd-spare-bedroom/hooks/typecheck) | `uv run mypy "$@"` | Run Mypy static type checking |
-| [`hooks/test`](file:///home/rtotheich/amd-spare-bedroom/hooks/test) | `uv run pytest "$@"` | Run test suite |
-| [`hooks/check-all`](file:///home/rtotheich/amd-spare-bedroom/hooks/check-all) | Run all of the above | Full pre-commit / pre-push verification |
+| [`hooks/run`](hooks/run) | `uv run python "$@"` | Run any Python script with the environment active |
+| [`hooks/lint`](hooks/lint) | `uv run ruff check "$@"` | Run Ruff linter checks |
+| [`hooks/format`](hooks/format) | `uv run ruff format "$@"` | Run Ruff code formatter |
+| [`hooks/typecheck`](hooks/typecheck) | `uv run mypy "$@"` | Run Mypy static type checking |
+| [`hooks/test`](hooks/test) | `uv run pytest "$@"` | Run test suite |
+| [`hooks/check-all`](hooks/check-all) | Run all of the above | Full pre-commit / pre-push verification |
 
 Usage example:
 ```bash
@@ -121,7 +142,7 @@ Usage example:
 
 ## Test-Driven Development (TDD) & Agreed Seams
 
-In accordance with our [TDD Guidelines](file:///home/rtotheich/amd-spare-bedroom/AGENTS.md), development proceeds in vertical slices against pre-agreed seams:
+In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vertical slices against pre-agreed seams:
 
 - **Seam 1: `VirtualGrid` & Topology**: Allocation, rank assignments, and address space memory budgeting.
 - **Seam 2: `VirtualCommunicator` & `LockstepBarrier`**: Inter-rank barrier, tensor all-reduce, and synchronization invariants.
@@ -129,13 +150,11 @@ In accordance with our [TDD Guidelines](file:///home/rtotheich/amd-spare-bedroom
 - **Seam 4: `VirtualDDP`**: Gradient hook attachment, parameter synchronization, and backward pass all-reduce.
 - **Seam 5: `VirtualFSDP` & Collective Sharding**: Parameter sharding ($\sim 1/N$ memory), on-demand All-Gather, and gradient Reduce-Scatter.
 
-
-
 ---
 
 ## Continuous Integration (CI)
 
-A credential-free GitHub Actions workflow is configured in [`.github/workflows/ci.yml`](file:///home/rtotheich/amd-spare-bedroom/.github/workflows/ci.yml) to automatically run:
+A credential-free GitHub Actions workflow is configured in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) to automatically run:
 - Ruff linting and formatting verification.
 - Mypy strict type checking across `src/` and `tests/`.
 - Pytest suite on CPU / mocked virtual grids (GPU tests marked with `@pytest.mark.gpu` are skipped in standard CI runners).
