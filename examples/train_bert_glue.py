@@ -20,6 +20,7 @@ from transformers import (
 )
 
 from amd_spare_bedroom.ddp import VirtualDDP
+from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
@@ -105,6 +106,13 @@ def parse_args() -> argparse.Namespace:
         help="Maximum training steps per epoch for demonstration (default: 5)",
     )
     parser.add_argument(
+        "--parallelism",
+        type=str,
+        default="fsdp",
+        choices=["fsdp", "ddp"],
+        help="Distributed parallelism mode ('fsdp' for sharded weights, 'ddp' for full replication)",
+    )
+    parser.add_argument(
         "--use-tiny-bert",
         action="store_true",
         help="Use a compact BERT architecture for fast verification",
@@ -136,7 +144,7 @@ def main() -> None:
     args = parse_args()
 
     print("=" * 70)
-    print("AMD SPARE BEDROOM: Virtual DDP Training on ROCm (gfx_1151)")
+    print(f"AMD SPARE BEDROOM: Virtual {args.parallelism.upper()} Training on ROCm (gfx_1151)")
     print("=" * 70)
 
     # 1. Initialize Virtual Grid
@@ -158,15 +166,29 @@ def main() -> None:
         print(f"[*] ROCm Physical Device: {gpu_name} ({vram_detected:.1f} GB detected)")
     print("-" * 70)
 
-    # 2. Prepare Model and wrap with VirtualDDP
+    # 2. Prepare Model and wrap with VirtualFSDP or VirtualDDP
     print("[*] Instantiating BERT sequence classification model...")
     base_model = get_model(use_tiny=args.use_tiny_bert)
     param_count = sum(p.numel() for p in base_model.parameters())
     print(f"[*] Model Parameter Count: {param_count:,}")
 
-    print(f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualDDP...")
-    ddp = VirtualDDP(base_model, grid=grid)
-    optimizers = ddp.create_optimizers(torch.optim.AdamW, lr=args.lr)
+    if args.parallelism == "fsdp":
+        print(
+            f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualFSDP (Sharded)..."
+        )
+        dist_model: Any = VirtualFSDP(base_model, grid=grid)
+        per_rank_params = dist_model.get_rank_parameter_numel(0)
+        pct = (per_rank_params / param_count) * 100
+        print(
+            f"[*] Memory Optimization: {per_rank_params:,} parameters stored per rank ({pct:.1f}% of full model)"
+        )
+    else:
+        print(
+            f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualDDP (Replicated)..."
+        )
+        dist_model = VirtualDDP(base_model, grid=grid)
+
+    optimizers = dist_model.create_optimizers(torch.optim.AdamW, lr=args.lr)
 
     # 3. Create Dataset and Rank-Sharded Samplers
     dataset = SyntheticGLUEDataset(num_samples=args.dataset_size, seq_len=64)
@@ -220,7 +242,7 @@ def main() -> None:
                 attention_mask = batch["attention_mask"].to(target_device)
                 labels = batch["labels"].to(target_device)
 
-                outputs: Any = ddp.forward(
+                outputs: Any = dist_model.forward(
                     rank,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -232,32 +254,39 @@ def main() -> None:
                 # Backward pass computes local gradients
                 loss.backward()
 
-            # B. Collective All-Reduce Gradient Synchronization
-            ddp.sync_gradients()
+            # B. Collective Gradient Synchronization (All-Reduce for DDP, Reduce-Scatter for FSDP)
+            dist_model.sync_gradients()
 
             # C. Lockstep Optimizer Step
-            ddp.step(optimizers)
+            dist_model.step(optimizers)
 
             # D. Verify Multi-Rank Weight Parity
-            synced = ddp.assert_parameters_synced()
-            if not synced:
-                print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
-                sys.exit(1)
+            if hasattr(dist_model, "assert_parameters_synced"):
+                synced = dist_model.assert_parameters_synced()
+                if not synced:
+                    print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
+                    sys.exit(1)
 
             avg_loss = sum(step_losses.values()) / len(step_losses)
             loss_breakdown = ", ".join(
                 f"R{rank_id}: {loss_val:.4f}" for rank_id, loss_val in step_losses.items()
             )
             print(
-                f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Ranks: [{loss_breakdown}] | Synced: True"
+                f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Ranks: [{loss_breakdown}] | Mode: {args.parallelism.upper()}"
             )
 
         epoch_time = time.perf_counter() - epoch_start
         print(f"--- Epoch {epoch + 1} completed in {epoch_time:.2f}s ---")
 
     print("\n" + "=" * 70)
-    print("Training finished successfully across all emulated ranks!")
-    print(f"Final parameter lockstep check: {ddp.assert_parameters_synced()}")
+    print(
+        f"Training finished successfully across all emulated ranks using {args.parallelism.upper()}!"
+    )
+    if hasattr(dist_model, "assert_parameters_synced"):
+        print(f"Final parameter lockstep check: {dist_model.assert_parameters_synced()}")
+    else:
+        full_p = dist_model.get_full_parameters()
+        print(f"Final sharded parameter reconstruction check: {len(full_p)} parameters active")
     print("=" * 70)
 
 

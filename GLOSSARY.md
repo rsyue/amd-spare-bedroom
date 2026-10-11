@@ -24,7 +24,8 @@ The collective communications engine (implemented in `VirtualCommunicator`) prov
 Emulation of PyTorch's `DistributedDataParallel`. Holds a full model replica per virtual rank, feeds rank-sharded data, hooks backward gradients to trigger All-Reduce across ranks, and executes synchronized parameter updates.
 
 ### Virtual FSDP (Fully Sharded Data Parallel)
-Emulation of PyTorch's FSDP. Shards model parameters, gradients, and optimizer states across virtual ranks, executing all-gather before forward/backward computations and reduce-scatter on gradients.
+Emulation of PyTorch's FSDP (implemented in `VirtualFSDP`). Shards model parameters, gradients, and optimizer states across virtual ranks, executing all-gather before forward/backward computations and reduce-scatter on gradients to achieve $\sim 1 / \text{world\_size}$ per-rank memory scaling.
+
 
 ### Virtual Rank Sampler
 A deterministic, seedable dataset partitioner that produces non-overlapping batch splits for each Virtual Rank without data duplication or cross-rank leakage.

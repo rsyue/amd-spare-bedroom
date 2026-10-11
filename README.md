@@ -40,9 +40,10 @@ While this hardware typically appears to the operating system as a single monoli
 
 1. **`VirtualGrid`**: Defines the virtual cluster topology (world size, virtual ranks, memory quota per rank, device backend).
 2. **`VirtualDevice`**: Represents an emulated GPU rank with isolated tensor namespaces, memory limits, and stream coordination.
-3. **`VirtualCommunicator`**: Provides collective communication primitives (`all_reduce`, `broadcast`, `gather`, `scatter`, `barrier`).
+3. **`VirtualCommunicator`**: Provides collective communication primitives (`all_reduce`, `broadcast`, `all_gather`, `reduce_scatter`, `barrier`).
 4. **`VirtualDDP`**: A drop-in wrapper mirroring `torch.nn.parallel.DistributedDataParallel` that coordinates gradient reduction across virtual ranks.
-5. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
+5. **`VirtualFSDP`**: Fully Sharded Data Parallel wrapper sharding parameters, gradients, and optimizer states across virtual ranks, executing All-Gather for forward passes and Reduce-Scatter for gradients to reduce memory footprint by $\sim 1 / \text{world\_size}$.
+6. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
 
 ---
 
@@ -82,14 +83,17 @@ uv pip install --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151 torch
 
 ## Running Examples
 
-An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](file:///home/rtotheich/amd-spare-bedroom/examples/train_bert_glue.py):
+An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](file:///home/rtotheich/amd-spare-bedroom/examples/train_bert_glue.py), supporting both **FSDP** (parameter sharded) and **DDP** (replicated):
 
 ```bash
-# Fast verification run with a compact BERT model across 4 virtual ranks:
-./hooks/run examples/train_bert_glue.py --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
+# Run with VirtualFSDP (sharded parameters cutting per-rank memory to 25%):
+./hooks/run examples/train_bert_glue.py --parallelism fsdp --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
 
-# Full BERT-base sequence classification across 8 virtual ranks:
-./hooks/run examples/train_bert_glue.py --ranks 8 --batch-size 4 --epochs 3
+# Run with VirtualDDP (replicated model with All-Reduce gradient synchronization):
+./hooks/run examples/train_bert_glue.py --parallelism ddp --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
+
+# Full BERT-base sequence classification across 8 virtual ranks with FSDP:
+./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3
 ```
 
 ---
@@ -109,7 +113,7 @@ The repository includes a set of lightweight wrapper scripts in [`hooks/`](file:
 
 Usage example:
 ```bash
-./hooks/run examples/train_bert_glue.py --use-tiny-bert --ranks 4 --epochs 2
+./hooks/run examples/train_bert_glue.py --parallelism fsdp --use-tiny-bert --ranks 4 --epochs 2
 ./hooks/check-all
 ```
 
@@ -123,6 +127,8 @@ In accordance with our [TDD Guidelines](file:///home/rtotheich/amd-spare-bedroom
 - **Seam 2: `VirtualCommunicator` & `LockstepBarrier`**: Inter-rank barrier, tensor all-reduce, and synchronization invariants.
 - **Seam 3: `VirtualRankSampler`**: Deterministic dataset partitioning without data leakage across virtual ranks.
 - **Seam 4: `VirtualDDP`**: Gradient hook attachment, parameter synchronization, and backward pass all-reduce.
+- **Seam 5: `VirtualFSDP` & Collective Sharding**: Parameter sharding ($\sim 1/N$ memory), on-demand All-Gather, and gradient Reduce-Scatter.
+
 
 
 ---
