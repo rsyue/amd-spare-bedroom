@@ -8,7 +8,7 @@ Canonical domain vocabulary for `amd-spare-bedroom`. Use these terms consistentl
 The simulated multi-rank cluster topology mapped onto a single physical AMD ROCm GPU (such as `gfx1151` with 96 GB unified VRAM). Defines the world size, rank membership, and total memory allocation.
 
 ### Virtual Rank
-An integer identifier ($0 \le \text{rank} < \text{world\_size}$) assigned to an emulated worker process/thread within the Virtual Grid.
+An integer identifier (`0 <= rank < world_size`) assigned to an emulated worker process/thread within the Virtual Grid.
 
 ### Virtual Device & Address Space
 The isolated runtime context allocated to a single Virtual Rank. Enforces rank-scoped memory limits and namespace separation on top of the underlying physical ROCm device (`hip:0` / `cuda:0`).
@@ -19,13 +19,25 @@ A synchronization barrier ensuring all virtual ranks execute forward, backward, 
 ### Virtual Communicator
 The collective communications engine (implemented in `VirtualCommunicator`) providing inter-rank primitives (`all_reduce`, `broadcast`, `gather`, `scatter`, `barrier`). Leverages zero-copy / unified memory buffers on APUs for fast local reductions.
 
-
 ### Virtual DDP (Distributed Data Parallel)
 Emulation of PyTorch's `DistributedDataParallel`. Holds a full model replica per virtual rank, feeds rank-sharded data, hooks backward gradients to trigger All-Reduce across ranks, and executes synchronized parameter updates.
 
 ### Virtual FSDP (Fully Sharded Data Parallel)
-Emulation of PyTorch's FSDP (implemented in `VirtualFSDP`). Shards model parameters, gradients, and optimizer states across virtual ranks, executing all-gather before forward/backward computations and reduce-scatter on gradients to achieve $\sim 1 / \text{world\_size}$ per-rank memory scaling.
-
+Emulation of PyTorch's FSDP (implemented in `VirtualFSDP`). Shards model parameters, gradients, and optimizer states across virtual ranks, executing all-gather before forward/backward computations and reduce-scatter on gradients to achieve ~`1 / world_size` per-rank memory scaling.
 
 ### Virtual Rank Sampler
 A deterministic, seedable dataset partitioner that produces non-overlapping batch splits for each Virtual Rank without data duplication or cross-rank leakage.
+
+## Architecture & Concept Relationships
+
+```mermaid
+flowchart TD
+    VG["VirtualGrid\n(World Size & Memory Pool)"] --> VR["Virtual Rank\n(0 <= rank < world_size)"]
+    VR --> VD["Virtual Device & Address Space\n(Rank Quota & Memory Isolation)"]
+    VG --> VC["VirtualCommunicator & Barrier\n(All-Reduce, All-Gather, Reduce-Scatter)"]
+    VG --> RS["VirtualRankSampler\n(Non-overlapping Data Slices)"]
+    VD --> DDP["VirtualDDP\n(Replicated Models)"]
+    VD --> FSDP["VirtualFSDP\n(Sharded ~1/N Memory)"]
+    VC -. "Synchronizes Gradients" .-> DDP
+    VC -. "Shards & Gathers" .-> FSDP
+```

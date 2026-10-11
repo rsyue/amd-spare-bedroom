@@ -23,26 +23,71 @@ While this hardware typically appears to the operating system as a single monoli
 
 ## Key Concepts & Architecture
 
+```mermaid
+flowchart TD
+    subgraph Host["Physical AMD Hardware (ROCm gfx_1151 / Strix Halo)"]
+        VRAM["Unified Physical Memory Pool (96 GB)"]
+        
+        subgraph Grid["VirtualGrid (N Virtual Ranks)"]
+            direction LR
+            subgraph R0["Virtual Rank 0 (Address Space 0)"]
+                M0["Model Replica / Shards"]
+                D0["Batch Shard 0"]
+                G0["Local Gradients"]
+            end
+            subgraph R1["Virtual Rank 1 (Address Space 1)"]
+                M1["Model Replica / Shards"]
+                D1["Batch Shard 1"]
+                G1["Local Gradients"]
+            end
+            subgraph Rn["Virtual Rank N-1 (Address Space N-1)"]
+                Mn["Model Replica / Shards"]
+                Dn["Batch Shard N-1"]
+                Gn["Local Gradients"]
+            end
+        end
+
+        subgraph Comm["VirtualCommunicator & Lockstep Barrier"]
+            AR["All-Reduce / Reduce-Scatter Collective Engine"]
+            Sync["Deterministic Parameter Synchronization"]
+        end
+
+        VRAM --> Grid
+        R0 <--> Comm
+        R1 <--> Comm
+        Rn <--> Comm
+    end
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                   Unified Physical VRAM (96 GB, gfx_1151)                   │
-├──────────────────────────────────────┬──────────────────────────────────────┤
-│  Virtual Rank 0 (Address Space 0)    │  Virtual Rank 1 (Address Space 1)    │
-│  - Model Replica                     │  - Model Replica                     │
-│  - Sharded Dataset Batch 0           │  - Sharded Dataset Batch 1           │
-│  - Local Gradients                   │  - Local Gradients                   │
-├──────────────────────────────────────┴──────────────────────────────────────┤
-│                    Lockstep Barrier & Communicator                          │
-│         - Gradient All-Reduce (Ring / Direct Unified Reduction)             │
-│         - Rank Parameter Synchronization                                    │
-└─────────────────────────────────────────────────────────────────────────────┘
+
+### Distributed Execution Flow
+
+```mermaid
+flowchart LR
+    subgraph DDPMode["VirtualDDP: Replicated Execution"]
+        direction TB
+        DDP_Fwd["1. Forward Pass (Local Replica)"]
+        DDP_Bwd["2. Backward Pass (Local Gradients)"]
+        DDP_Sync["3. All-Reduce Gradients across Ranks"]
+        DDP_Step["4. Lockstep Optimizer Step"]
+        DDP_Fwd --> DDP_Bwd --> DDP_Sync --> DDP_Step
+    end
+
+    subgraph FSDPMode["VirtualFSDP: Sharded Execution (~1/N Memory)"]
+        direction TB
+        FSDP_Gather["1. All-Gather Parameters on Demand"]
+        FSDP_Fwd["2. Forward Pass (Full Weights)"]
+        FSDP_Bwd["3. Backward Pass (Full Gradients)"]
+        FSDP_Scatter["4. Reduce-Scatter Gradients into Shards"]
+        FSDP_Step["5. Sharded Optimizer Step"]
+        FSDP_Gather --> FSDP_Fwd --> FSDP_Bwd --> FSDP_Scatter --> FSDP_Step
+    end
 ```
 
 1. **`VirtualGrid`**: Defines the virtual cluster topology (world size, virtual ranks, memory quota per rank, device backend).
 2. **`VirtualDevice`**: Represents an emulated GPU rank with isolated tensor namespaces, memory limits, and stream coordination.
 3. **`VirtualCommunicator`**: Provides collective communication primitives (`all_reduce`, `broadcast`, `all_gather`, `reduce_scatter`, `barrier`).
 4. **`VirtualDDP`**: A drop-in wrapper mirroring `torch.nn.parallel.DistributedDataParallel` that coordinates gradient reduction across virtual ranks.
-5. **`VirtualFSDP`**: Fully Sharded Data Parallel wrapper sharding parameters, gradients, and optimizer states across virtual ranks, executing All-Gather for forward passes and Reduce-Scatter for gradients to reduce memory footprint by $\sim 1 / \text{world\_size}$.
+5. **`VirtualFSDP`**: Fully Sharded Data Parallel wrapper sharding parameters, gradients, and optimizer states across virtual ranks, executing All-Gather for forward passes and Reduce-Scatter for gradients to reduce memory footprint by ~`1 / world_size`.
 6. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
 
 ---
@@ -148,7 +193,7 @@ In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vert
 - **Seam 2: `VirtualCommunicator` & `LockstepBarrier`**: Inter-rank barrier, tensor all-reduce, and synchronization invariants.
 - **Seam 3: `VirtualRankSampler`**: Deterministic dataset partitioning without data leakage across virtual ranks.
 - **Seam 4: `VirtualDDP`**: Gradient hook attachment, parameter synchronization, and backward pass all-reduce.
-- **Seam 5: `VirtualFSDP` & Collective Sharding**: Parameter sharding ($\sim 1/N$ memory), on-demand All-Gather, and gradient Reduce-Scatter.
+- **Seam 5: `VirtualFSDP` & Collective Sharding**: Parameter sharding (~`1/N` memory), on-demand All-Gather, and gradient Reduce-Scatter.
 
 ---
 
