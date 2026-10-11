@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "amd-spare-bedroom"
+version = "0.1.0"
+description = "Emulate multiple AMD GPU devices and distributed ranks (DDP, FSDP) within large VRAM on AMD ROCm (gfx_1151 / Strix Halo)"
+readme = "README.md"
+requires-python = "==3.12.*"
+license = { text = "MIT" }
+authors = [
+    { name = "AMD Spare Bedroom Contributors" }
+]
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.40.0",
+    "datasets>=2.19.0",
+    "evaluate>=0.4.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.7.0",
+    "typing-extensions>=4.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "mypy>=1.10.0",
+    "ruff>=0.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "mypy>=1.10.0",
+    "ruff>=0.5.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501", # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.uv]
+default-groups = ["dev"]
+prerelease = "allow"
+extra-index-url = ["https://rocm.nightlies.amd.com/v2/gfx1151"]
+
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --strict-markers"
+markers = [
+    "gpu: marks tests that require AMD ROCm GPU hardware (deselect with '-m \"not gpu\"')",
+    "ddp: marks tests exercising virtual DDP mechanics",
+    "fsdp: marks tests exercising virtual FSDP mechanics",
+]
+

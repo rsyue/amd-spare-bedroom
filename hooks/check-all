@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Running ruff check..."
+uv run --no-sync ruff check .
+
+echo "==> Checking formatting with ruff..."
+uv run --no-sync ruff format --check .
+
+echo "==> Running mypy type checking..."
+uv run --no-sync mypy src tests
+
+echo "==> Running pytest suite..."
+uv run --no-sync pytest -m "not gpu" "$@"
+
+echo "==> All checks passed!"
+
