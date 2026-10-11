@@ -50,3 +50,9 @@ def test_virtual_grid_invalid_world_size() -> None:
     """Verify that world_size < 1 is rejected."""
     with pytest.raises(ValueError, match="world_size must be >= 1"):
         VirtualGrid.create(world_size=0, total_memory_gb=16.0, device_type="cpu")
+
+
+def test_virtual_grid_auto_device_detection() -> None:
+    """Verify that device_type='auto' resolves to cpu or cuda."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="auto")
+    assert grid.device_type in ("cpu", "cuda")

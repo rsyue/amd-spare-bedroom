@@ -56,7 +56,12 @@ class VirtualGrid:
         total_bytes = int(total_memory_gb * 1024 * 1024 * 1024)
 
         if device_type == "auto":
-            device_type = "cpu"
+            try:
+                import torch
+
+                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                device_type = "cpu"
 
         return cls(
             world_size=world_size,

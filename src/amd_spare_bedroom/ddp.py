@@ -32,8 +32,11 @@ class VirtualDDP[ModelT: nn.Module]:
         self.grid = grid
         self.communicator = communicator if communicator is not None else VirtualCommunicator(grid)
 
+        target_device = torch.device(self.grid.device_type)
         # Allocate an isolated model replica for each virtual rank
-        self.replicas: dict[int, ModelT] = {rank: copy.deepcopy(module) for rank in self.grid.ranks}
+        self.replicas: dict[int, ModelT] = {
+            rank: copy.deepcopy(module).to(target_device) for rank in self.grid.ranks
+        }
 
     def get_replica(self, rank: int) -> ModelT:
         """Retrieve the model replica for a specific virtual rank."""
