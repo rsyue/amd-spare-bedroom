@@ -40,9 +40,9 @@ While this hardware typically appears to the operating system as a single monoli
 
 1. **`VirtualGrid`**: Defines the virtual cluster topology (world size, virtual ranks, memory quota per rank, device backend).
 2. **`VirtualDevice`**: Represents an emulated GPU rank with isolated tensor namespaces, memory limits, and stream coordination.
-3. **`Communicator`**: Provides collective communication primitives (`all_reduce`, `broadcast`, `gather`, `scatter`, `barrier`).
+3. **`VirtualCommunicator`**: Provides collective communication primitives (`all_reduce`, `broadcast`, `gather`, `scatter`, `barrier`).
 4. **`VirtualDDP`**: A drop-in wrapper mirroring `torch.nn.parallel.DistributedDataParallel` that coordinates gradient reduction across virtual ranks.
-5. **`VirtualSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
+5. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
 
 ---
 
@@ -50,7 +50,7 @@ While this hardware typically appears to the operating system as a single monoli
 
 - **Python**: `>=3.12`
 - **Environment Manager**: [`uv`](https://github.com/astral-sh/uv)
-- **Hardware Target**: AMD ROCm GPU (initial target: `gfx_1151` / RDNA 3.5 / Radeon 8060S)
+- **Hardware Target**: AMD ROCm GPU (initial target: `gfx_1151` / RDNA 3.5 / Radeon 8060S with up to 96 GB VRAM)
 - **Monitoring**: `amdgpu_top` or `rocm-smi`
 
 ---
@@ -66,16 +66,30 @@ source .venv/bin/activate
 
 ### 2. Install Dependencies
 
-Install the core package along with development tools (linting, formatting, type checking, pytest):
+The project is pre-configured in [`pyproject.toml`](file:///home/rtotheich/amd-spare-bedroom/pyproject.toml) with the official AMD ROCm nightly index for `gfx1151` (`https://rocm.nightlies.amd.com/v2/gfx1151`). Simply sync the environment:
 
 ```bash
 uv sync --extra dev
 ```
 
-For ROCm-accelerated PyTorch wheels (ROCm 6.2+):
+To manually install or update ROCm PyTorch wheels for `gfx_1151`:
 
 ```bash
-uv pip install --index-url https://download.pytorch.org/whl/rocm6.2 torch
+uv pip install --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151 torch
+```
+
+---
+
+## Running Examples
+
+An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](file:///home/rtotheich/amd-spare-bedroom/examples/train_bert_glue.py):
+
+```bash
+# Fast verification run with a compact BERT model across 4 virtual ranks:
+./hooks/run examples/train_bert_glue.py --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
+
+# Full BERT-base sequence classification across 8 virtual ranks:
+./hooks/run examples/train_bert_glue.py --ranks 8 --batch-size 4 --epochs 3
 ```
 
 ---
@@ -95,7 +109,7 @@ The repository includes a set of lightweight wrapper scripts in [`hooks/`](file:
 
 Usage example:
 ```bash
-./hooks/run examples/train_bert_ddp.py --ranks 4 --epochs 3
+./hooks/run examples/train_bert_glue.py --use-tiny-bert --ranks 4 --epochs 2
 ./hooks/check-all
 ```
 
@@ -106,9 +120,10 @@ Usage example:
 In accordance with our [TDD Guidelines](file:///home/rtotheich/amd-spare-bedroom/AGENTS.md), development proceeds in vertical slices against pre-agreed seams:
 
 - **Seam 1: `VirtualGrid` & Topology**: Allocation, rank assignments, and address space memory budgeting.
-- **Seam 2: `Communicator` & `LockstepBarrier`**: Inter-rank barrier, tensor all-reduce, and synchronization invariants.
-- **Seam 3: `VirtualSampler`**: Deterministic dataset partitioning without data leakage across virtual ranks.
+- **Seam 2: `VirtualCommunicator` & `LockstepBarrier`**: Inter-rank barrier, tensor all-reduce, and synchronization invariants.
+- **Seam 3: `VirtualRankSampler`**: Deterministic dataset partitioning without data leakage across virtual ranks.
 - **Seam 4: `VirtualDDP`**: Gradient hook attachment, parameter synchronization, and backward pass all-reduce.
+
 
 ---
 

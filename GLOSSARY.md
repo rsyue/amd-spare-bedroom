@@ -16,8 +16,9 @@ The isolated runtime context allocated to a single Virtual Rank. Enforces rank-s
 ### Lockstep Barrier
 A synchronization barrier ensuring all virtual ranks execute forward, backward, and optimization steps in deterministic lockstep, simulating synchronized multi-device execution.
 
-### Communicator
-The collective communications engine providing inter-rank primitives (`all_reduce`, `broadcast`, `gather`, `scatter`, `barrier`). Leverages zero-copy / unified memory buffers on APUs for fast local reductions.
+### Virtual Communicator
+The collective communications engine (implemented in `VirtualCommunicator`) providing inter-rank primitives (`all_reduce`, `broadcast`, `gather`, `scatter`, `barrier`). Leverages zero-copy / unified memory buffers on APUs for fast local reductions.
+
 
 ### Virtual DDP (Distributed Data Parallel)
 Emulation of PyTorch's `DistributedDataParallel`. Holds a full model replica per virtual rank, feeds rank-sharded data, hooks backward gradients to trigger All-Reduce across ranks, and executes synchronized parameter updates.
