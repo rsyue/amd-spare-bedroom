@@ -13,6 +13,11 @@ from amd_spare_bedroom.grid import (
     VirtualGrid,
     seed_everything,
 )
+from amd_spare_bedroom.metrics import (
+    ClassificationMetrics,
+    compute_classification_metrics,
+    evaluate_classification_epoch,
+)
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
 __version__ = "0.1.0"
@@ -20,12 +25,15 @@ __license__ = "CC-BY-NC-ND-4.0"
 
 __all__ = [
     "AmpGradScalerState",
+    "ClassificationMetrics",
     "VirtualCommunicator",
     "VirtualDDP",
     "VirtualDevice",
     "VirtualFSDP",
     "VirtualGrid",
     "VirtualRankSampler",
+    "compute_classification_metrics",
+    "evaluate_classification_epoch",
     "resolve_amp_dtype",
     "seed_everything",
 ]

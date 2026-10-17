@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
 import torch
 
@@ -83,3 +83,13 @@ class VirtualRankSampler:
     def __len__(self) -> int:
         """Return the number of samples for this rank."""
         return self.num_samples
+
+    @staticmethod
+    def unstride_and_unpad(
+        rank_tensors: Sequence[torch.Tensor],
+        dataset_size: int,
+    ) -> torch.Tensor:
+        """Reconstruct sequential dataset order from stride-partitioned rank outputs and strip padding."""
+        stacked = torch.stack(list(rank_tensors), dim=0).transpose(0, 1)
+        interleaved = stacked.reshape(-1, *stacked.shape[2:])
+        return interleaved[:dataset_size]
