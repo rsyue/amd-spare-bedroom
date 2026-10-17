@@ -69,6 +69,14 @@ class GridSearchResult:
     higher_is_better: bool
     num_waves: int
 
+    def format_winner_announcement(self) -> str:
+        """Format the canonical winning combination announcement string."""
+        return BestCheckpointSaver.format_winner(
+            hyperparameters=self.best_trial.trial.params,
+            metric_name=self.metric_name,
+            best_score=self.best_trial.best_score,
+        )
+
 
 class HyperparameterGrid:
     """Deterministic Cartesian hyperparameter search space and wave scheduler."""

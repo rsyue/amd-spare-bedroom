@@ -30,8 +30,22 @@ from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
+from amd_spare_bedroom.grid_search import VirtualGridSearch
 from amd_spare_bedroom.metrics import evaluate_classification_epoch
 from amd_spare_bedroom.sampler import VirtualRankSampler
+
+DEFAULT_LR_GRID_STR = "1e-5,2e-5,3e-5,5e-5,1e-4"
+DEFAULT_WEIGHT_DECAY_GRID_STR = "0.0,0.001,0.01,0.05,0.1"
+
+
+def parse_float_grid(raw: str, *, name: str = "grid") -> list[float]:
+    """Parse a comma- or whitespace-separated string into a list of floats."""
+    tokens = [tok for part in raw.split(",") for tok in part.split() if tok.strip()]
+    values = [float(tok) for tok in tokens]
+    if not values:
+        raise ValueError(f"{name} must contain at least one numeric value.")
+    return values
+
 
 GLUE_TASK_TO_KEYS: dict[str, tuple[str, ...]] = {
     "cola": ("sentence",),
@@ -301,6 +315,23 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         dest="checkpoint_dir",
         help="Directory path to save the single best HuggingFace safetensors + tokenizer checkpoint",
     )
+    parser.add_argument(
+        "--grid-search",
+        action="store_true",
+        help="Run multi-rank hyperparameter grid search across sequential waves",
+    )
+    parser.add_argument(
+        "--lr-grid",
+        type=str,
+        default=DEFAULT_LR_GRID_STR,
+        help=f"Comma- or space-separated learning rates for grid search (default: '{DEFAULT_LR_GRID_STR}')",
+    )
+    parser.add_argument(
+        "--weight-decay-grid",
+        type=str,
+        default=DEFAULT_WEIGHT_DECAY_GRID_STR,
+        help=f"Comma- or space-separated weight decay values for grid search (default: '{DEFAULT_WEIGHT_DECAY_GRID_STR}')",
+    )
     return parser.parse_args(args)
 
 
@@ -394,7 +425,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[*] ROCm Physical Device: {gpu_name} ({vram_detected:.1f} GB detected)")
     print("-" * 70)
 
-    # 2. Prepare Model and wrap with VirtualFSDP or VirtualDDP
+    # 2. Prepare Model
     print("[*] Instantiating BERT sequence classification model...")
     num_labels = GLUE_TASK_NUM_LABELS.get(args.task_name, 2)
     base_model = get_model(
@@ -404,6 +435,77 @@ def main(argv: list[str] | None = None) -> None:
     )
     param_count = sum(p.numel() for p in base_model.parameters())
     print(f"[*] Model Parameter Count: {param_count:,}")
+
+    # 3. Create Dataset
+    dataset = get_dataset(
+        task_name=args.task_name,
+        model_name=args.model_name,
+        max_seq_length=args.max_seq_length,
+        dataset_size=args.dataset_size,
+        synthetic=args.synthetic,
+        split="train",
+    )
+    eval_dataset = get_dataset(
+        task_name=args.task_name,
+        model_name=args.model_name,
+        max_seq_length=args.max_seq_length,
+        dataset_size=args.dataset_size,
+        synthetic=args.synthetic,
+        split="validation",
+    )
+
+    dataset_sized = cast(Sized, dataset)
+    target_device = torch.device(grid.device_type)
+    dataset_type = "Synthetic" if args.synthetic else f"GLUE ({args.task_name.upper()})"
+    print(f"[*] Dataset:              {dataset_type} ({len(dataset_sized)} samples)")
+    has_max_steps = args.max_steps is not None and args.max_steps > 0
+    max_steps_str = f"max {args.max_steps} steps/epoch" if has_max_steps else "full epoch"
+    print(f"[*] Training configured for {args.epochs} epoch(s), {max_steps_str}")
+
+    resolved_checkpoint_dir = (
+        args.checkpoint_dir
+        if args.checkpoint_dir is not None
+        else ("checkpoints/best_model" if args.grid_search else None)
+    )
+    checkpoint_saver: BestCheckpointSaver | None = None
+    if resolved_checkpoint_dir is not None:
+        tokenizer = get_tokenizer(args.model_name, synthetic=args.synthetic)
+        checkpoint_saver = BestCheckpointSaver(
+            checkpoint_dir=resolved_checkpoint_dir,
+            metric_name=args.eval_metric,
+            tokenizer=tokenizer,
+        )
+
+    if args.grid_search:
+        lrs = parse_float_grid(args.lr_grid, name="--lr-grid")
+        weight_decays = parse_float_grid(args.weight_decay_grid, name="--weight-decay-grid")
+        total_trials = len(lrs) * len(weight_decays)
+        print(
+            f"[*] Running VirtualGridSearch: {total_trials} trials across {grid.world_size} virtual ranks"
+        )
+        print("=" * 70)
+        search = VirtualGridSearch(
+            base_model=base_model,
+            grid=grid,
+            param_grid={"lr": lrs, "weight_decay": weight_decays},
+            metric_name=args.eval_metric,
+            amp_dtype=args.amp,
+            max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+            seed=args.seed,
+            checkpoint_saver=checkpoint_saver,
+        )
+        result = search.run(
+            train_dataset=dataset,
+            eval_dataset=eval_dataset,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            max_steps=args.max_steps,
+        )
+        print(
+            f"[*] Grid search completed {len(result.trials)} trials in {result.num_waves} wave(s)."
+        )
+        print(result.format_winner_announcement())
+        return
 
     if args.parallelism == "fsdp":
         print(
@@ -426,28 +528,8 @@ def main(argv: list[str] | None = None) -> None:
         torch.optim.AdamW, lr=args.lr, weight_decay=args.weight_decay
     )
 
-    # 3. Create Dataset and Rank-Sharded Samplers
-    dataset = get_dataset(
-        task_name=args.task_name,
-        model_name=args.model_name,
-        max_seq_length=args.max_seq_length,
-        dataset_size=args.dataset_size,
-        synthetic=args.synthetic,
-        split="train",
-    )
-    eval_dataset = get_dataset(
-        task_name=args.task_name,
-        model_name=args.model_name,
-        max_seq_length=args.max_seq_length,
-        dataset_size=args.dataset_size,
-        synthetic=args.synthetic,
-        split="validation",
-    )
-
     rank_loaders: dict[int, DataLoader[dict[str, torch.Tensor]]] = {}
     samplers: dict[int, VirtualRankSampler] = {}
-
-    dataset_sized = cast(Sized, dataset)
     for rank in grid.ranks:
         sampler = VirtualRankSampler(
             dataset_size=len(dataset_sized),
@@ -462,23 +544,7 @@ def main(argv: list[str] | None = None) -> None:
             batch_size=args.batch_size,
             sampler=sampler,
         )
-
-    target_device = torch.device(grid.device_type)
-    dataset_type = "Synthetic" if args.synthetic else f"GLUE ({args.task_name.upper()})"
-    print(f"[*] Dataset:              {dataset_type} ({len(dataset_sized)} samples)")
-    has_max_steps = args.max_steps is not None and args.max_steps > 0
-    max_steps_str = f"max {args.max_steps} steps/epoch" if has_max_steps else "full epoch"
-    print(f"[*] Training configured for {args.epochs} epoch(s), {max_steps_str}")
     print("=" * 70)
-
-    checkpoint_saver: BestCheckpointSaver | None = None
-    if args.checkpoint_dir is not None:
-        tokenizer = get_tokenizer(args.model_name, synthetic=args.synthetic)
-        checkpoint_saver = BestCheckpointSaver(
-            checkpoint_dir=args.checkpoint_dir,
-            metric_name=args.eval_metric,
-            tokenizer=tokenizer,
-        )
 
     # 4. Training Loop with Lockstep All-Reduce Synchronization
     for epoch in range(args.epochs):

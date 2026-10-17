@@ -42,6 +42,9 @@ def test_parse_args_defaults() -> None:
     assert args.weight_decay == 0.01
     assert args.eval_metric == "f1"
     assert args.checkpoint_dir is None
+    assert args.grid_search is False
+    assert args.lr_grid == "1e-5,2e-5,3e-5,5e-5,1e-4"
+    assert args.weight_decay_grid == "0.0,0.001,0.01,0.05,0.1"
 
 
 def test_parse_args_custom_and_aliases() -> None:
@@ -85,6 +88,11 @@ def test_parse_args_custom_and_aliases() -> None:
         "accuracy",
         "--checkpoint-dir",
         "/tmp/ckpt_test",
+        "--grid-search",
+        "--lr-grid",
+        "1e-5,2e-5",
+        "--weight-decay-grid",
+        "0.0,0.01",
     ]
     args = parse_args(cli_args)
     assert args.ranks == 8
@@ -107,6 +115,9 @@ def test_parse_args_custom_and_aliases() -> None:
     assert args.max_grad_norm == 0.5
     assert args.eval_metric == "accuracy"
     assert args.checkpoint_dir == "/tmp/ckpt_test"
+    assert args.grid_search is True
+    assert args.lr_grid == "1e-5,2e-5"
+    assert args.weight_decay_grid == "0.0,0.01"
 
 
 def test_parse_args_use_synthetic_alias() -> None:
@@ -240,3 +251,68 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any, tmp_path: Any) -> None:
     assert (ckpt_dir / "tokenizer.json").is_file()
     assert (ckpt_dir / "checkpoint_metadata.json").is_file()
     assert "Training finished successfully" in out
+
+
+def test_main_grid_search_end_to_end_and_checkpoint_persistence(capsys: Any, tmp_path: Any) -> None:
+    """Seam 2 (#8): End-to-end --grid-search saves single safetensors checkpoint and announces winner last."""
+    import re
+
+    import pytest
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    from examples.train_bert_glue import parse_float_grid
+
+    assert parse_float_grid("1e-5, 2e-5,3e-5") == [1e-5, 2e-5, 3e-5]
+    assert parse_float_grid("0.0 0.01 0.1") == [0.0, 0.01, 0.1]
+    with pytest.raises(ValueError, match="must contain at least one numeric value"):
+        parse_float_grid(" , ")
+
+    ckpt_dir = tmp_path / "best_ckpt"
+    main(
+        [
+            "--grid-search",
+            "--lr-grid",
+            "1e-5,1e-3",
+            "--weight-decay-grid",
+            "0.0,0.01",
+            "--ranks",
+            "2",
+            "--synthetic",
+            "--use-tiny-bert",
+            "--batch-size",
+            "4",
+            "--dataset-size",
+            "8",
+            "--seq-len",
+            "16",
+            "--epochs",
+            "1",
+            "--max-steps",
+            "2",
+            "--device",
+            "cpu",
+            "--seed",
+            "123",
+            "--eval-metric",
+            "f1",
+            "--checkpoint-dir",
+            str(ckpt_dir),
+        ]
+    )
+    out = capsys.readouterr().out
+    lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    assert len(lines) >= 2
+    assert re.match(
+        r"^LR of .+ and weight decay of .+ wins at [0-9]+\.[0-9]{2} F1$",
+        lines[-1],
+    )
+
+    assert (ckpt_dir / "model.safetensors").is_file()
+    assert (ckpt_dir / "config.json").is_file()
+    assert (ckpt_dir / "tokenizer.json").is_file()
+    assert (ckpt_dir / "checkpoint_metadata.json").is_file()
+
+    loaded_model = AutoModelForSequenceClassification.from_pretrained(ckpt_dir)
+    loaded_tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+    assert loaded_model.config.num_labels == 2
+    assert loaded_tokenizer.pad_token == "[PAD]"
