@@ -162,7 +162,9 @@ Key CLI options:
 - `--device`: Target device type (`cuda`, `cpu`, or auto-detected; default: auto-detect).
 - `--model-name`: HuggingFace model identifier (default: `bert-base-uncased`).
 - `--use-tiny-bert`: Use compact 2-layer BERT for fast local verification.
-- `--seed`: Random seed for data shuffling and sampling (default: 42).
+- `--seed`: Random seed for data shuffling, sampling, and model initialization via `seed_everything` (default: 42).
+- `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none`).
+
 
 ---
 

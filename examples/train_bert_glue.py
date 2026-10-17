@@ -24,7 +24,7 @@ from transformers import (
 
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
-from amd_spare_bedroom.grid import VirtualGrid
+from amd_spare_bedroom.grid import VirtualGrid, seed_everything
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
 GLUE_TASK_TO_KEYS: dict[str, tuple[str, ...]] = {
@@ -263,6 +263,15 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=42,
         help="Random seed for data shuffling and sampling (default: 42)",
     )
+    parser.add_argument(
+        "--amp",
+        "--precision",
+        type=str,
+        default="none",
+        dest="amp",
+        choices=["none", "fp32", "float32", "bf16", "bfloat16", "fp16", "float16"],
+        help="Automatic mixed precision mode ('none'/'fp32', 'bf16'/'bfloat16', 'fp16'/'float16'; default: 'none')",
+    )
     return parser.parse_args(args)
 
 
@@ -298,10 +307,10 @@ def get_model(
     )
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
 
     print("=" * 70)
     print(f"AMD SPARE BEDROOM: Virtual {args.parallelism.upper()} Training on ROCm (gfx_1151)")
@@ -312,6 +321,7 @@ def main() -> None:
         world_size=args.ranks,
         total_memory_gb=args.total_vram_gb,
         device_type=args.device,
+        seed=args.seed,
     )
 
     per_rank_gb = grid.per_rank_memory_bytes / (1024**3)
@@ -319,6 +329,7 @@ def main() -> None:
     print(f"[*] Virtual World Size:   {grid.world_size} ranks")
     print(f"[*] Per-Rank Budget:      {per_rank_gb:.2f} GB per virtual device")
     print(f"[*] Active Device Type:   {grid.device_type.upper()}")
+    print(f"[*] AMP Precision Mode:   {args.amp.upper()}")
 
     if grid.device_type == "cuda" and torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
@@ -341,7 +352,7 @@ def main() -> None:
         print(
             f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualFSDP (Sharded)..."
         )
-        dist_model: Any = VirtualFSDP(base_model, grid=grid)
+        dist_model: Any = VirtualFSDP(base_model, grid=grid, amp_dtype=args.amp)
         per_rank_params = dist_model.get_rank_parameter_numel(0)
         pct = (per_rank_params / param_count) * 100
         print(
@@ -351,8 +362,9 @@ def main() -> None:
         print(
             f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualDDP (Replicated)..."
         )
-        dist_model = VirtualDDP(base_model, grid=grid)
+        dist_model = VirtualDDP(base_model, grid=grid, amp_dtype=args.amp)
 
+    dist_model.train()
     optimizers = dist_model.create_optimizers(torch.optim.AdamW, lr=args.lr)
 
     # 3. Create Dataset and Rank-Sharded Samplers
@@ -394,6 +406,7 @@ def main() -> None:
     # 4. Training Loop with Lockstep All-Reduce Synchronization
     for epoch in range(args.epochs):
         print(f"\n>>> Epoch {epoch + 1}/{args.epochs}")
+        dist_model.train()
         for rank in grid.ranks:
             samplers[rank].set_epoch(epoch)
 
@@ -433,33 +446,17 @@ def main() -> None:
                 loss = outputs.loss
                 step_losses[rank] = float(loss.item())
 
-                # Backward pass computes local gradients
-                loss.backward()
+                # Backward pass computes local gradients (with GradScaler when FP16 AMP is active)
+                dist_model.backward(rank, loss)
 
             # B. Collective Gradient Synchronization (All-Reduce for DDP, Reduce-Scatter for FSDP)
             dist_model.sync_gradients()
 
-            # Clip gradients to ensure numerical stability across virtual ranks
+            # Clip gradients via library seam to ensure numerical stability across virtual ranks
+            grad_norm_val = 0.0
             if args.max_grad_norm > 0:
-                for rank in grid.ranks:
-                    if args.parallelism == "fsdp":
-                        sharded_params = dist_model.get_sharded_parameters(rank)
-                        for p in sharded_params:
-                            if p.grad is not None:
-                                p.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
-                        torch.nn.utils.clip_grad_norm_(
-                            sharded_params,
-                            args.max_grad_norm,
-                        )
-                    else:
-                        replica_params = list(dist_model.replicas[rank].parameters())
-                        for p in replica_params:
-                            if p.grad is not None:
-                                p.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
-                        torch.nn.utils.clip_grad_norm_(
-                            replica_params,
-                            args.max_grad_norm,
-                        )
+                grad_norms = dist_model.clip_grad_norm(args.max_grad_norm)
+                grad_norm_val = grad_norms[grid.ranks[0]]
 
             # C. Lockstep Optimizer Step
             dist_model.step(optimizers)
@@ -485,7 +482,7 @@ def main() -> None:
                 f"R{rank_id}: {loss_val:.4f}" for rank_id, loss_val in step_losses.items()
             )
             print(
-                f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Ranks: [{loss_breakdown}] | Mode: {args.parallelism.upper()}"
+                f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Grad Norm: {grad_norm_val:.4f} | Ranks: [{loss_breakdown}] | Mode: {args.parallelism.upper()}"
             )
 
         epoch_time = time.perf_counter() - epoch_start

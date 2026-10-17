@@ -5,11 +5,12 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import torch
 import torch.nn as nn
 
+from amd_spare_bedroom.amp import AmpGradScalerState
 from amd_spare_bedroom.communicator import VirtualCommunicator
 
 if TYPE_CHECKING:
@@ -41,10 +42,18 @@ class VirtualFSDP[ModelT: nn.Module]:
         module: ModelT,
         grid: VirtualGrid,
         communicator: VirtualCommunicator | None = None,
+        amp_dtype: torch.dtype | str | None = None,
     ) -> None:
         self.grid = grid
         self.communicator = communicator if communicator is not None else VirtualCommunicator(grid)
         self.target_device = torch.device(grid.device_type)
+        self._is_training: bool = module.training
+        self._amp = AmpGradScalerState(
+            device_type=self.grid.device_type,
+            ranks=self.grid.ranks,
+            amp_dtype=amp_dtype,
+        )
+        self.amp_dtype: torch.dtype | None = self._amp.amp_dtype
 
         # Base skeleton for executing forward/backward passes
         self._skeleton: ModelT = copy.deepcopy(module).to(self.target_device)
@@ -94,6 +103,27 @@ class VirtualFSDP[ModelT: nn.Module]:
             rank: copy.deepcopy(self._skeleton) for rank in self.grid.ranks
         }
 
+    @property
+    def is_training(self) -> bool:
+        """Return whether the sharded wrapper is currently in training mode."""
+        return self._is_training
+
+    def get_grad_scale(self, rank: int = 0) -> float:
+        """Return the active AMP GradScaler scale factor for the given rank."""
+        return self._amp.get_scale(rank)
+
+    def train(self, mode: bool = True) -> Self:
+        """Set training mode across the skeleton and all rank execution replicas."""
+        self._is_training = mode
+        self._skeleton.train(mode)
+        for replica in self._exec_replicas.values():
+            replica.train(mode)
+        return self
+
+    def eval(self) -> Self:
+        """Set evaluation mode across the skeleton and all rank execution replicas."""
+        return self.train(False)
+
     def get_sharded_parameters(self, rank: int) -> list[nn.Parameter]:
         """Retrieve the parameter shards owned by a specific virtual rank."""
         if rank not in self.rank_shards:
@@ -132,15 +162,42 @@ class VirtualFSDP[ModelT: nn.Module]:
 
     def forward(self, rank: int, *args: Any, **kwargs: Any) -> Any:
         """Execute a forward pass on rank by temporarily all-gathering full parameters."""
+        if rank not in self._exec_replicas:
+            raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
         self._gather_into_replica(rank)
-        return self._exec_replicas[rank](*args, **kwargs)
+        with self._amp.autocast_context():
+            return self._exec_replicas[rank](*args, **kwargs)
+
+    def eval_forward(self, rank: int, *args: Any, **kwargs: Any) -> Any:
+        """Execute an evaluation forward pass on rank under torch.no_grad()."""
+        if rank not in self._exec_replicas:
+            raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
+        replica = self._exec_replicas[rank]
+        was_training = replica.training
+        replica.eval()
+        try:
+            with torch.no_grad():
+                return self.forward(rank, *args, **kwargs)
+        finally:
+            if was_training:
+                replica.train(True)
+
+    def backward(self, rank: int, loss: torch.Tensor) -> None:
+        """Execute a backward pass on rank, scaling loss when FP16 GradScaler is active."""
+        if rank not in self._exec_replicas:
+            raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
+        self._amp.backward(rank, loss)
 
     def sync_gradients(self) -> None:
         """Reduce-Scatter full gradients back into each rank's owned parameter shard.
 
-        Sanitizes non-finite gradients (NaN/Inf) prior to reduction to ensure
-        numerical stability across sharded ranks.
+        Unscales FP16 gradients (detecting overflow prior to sanitization) and sanitizes
+        non-finite gradients (NaN/Inf) prior to reduction.
         """
+        self._amp.unscale_and_check_finite(
+            {rank: self._exec_replicas[rank].parameters() for rank in self.grid.ranks}
+        )
+
         for name, meta in self.metadata.items():
             # Check if gradient exists
             p0 = dict(self._exec_replicas[self.grid.ranks[0]].named_parameters())[name]
@@ -178,6 +235,58 @@ class VirtualFSDP[ModelT: nn.Module]:
             for rank in self.grid.ranks:
                 dict(self._exec_replicas[rank].named_parameters())[name].grad = None
 
+    def clip_grad_norm(
+        self,
+        max_norm: float,
+        norm_type: float = 2.0,
+    ) -> dict[int, float]:
+        """Compute exact global gradient norm across all ranks' shards and clip in lockstep.
+
+        Returns:
+            Mapping from rank ID to the pre-clipping global gradient norm.
+        """
+        self._amp.unscale_and_check_finite(
+            {rank: self.get_sharded_parameters(rank) for rank in self.grid.ranks}
+        )
+        for rank in self.grid.ranks:
+            for shard in self.get_sharded_parameters(rank):
+                if shard.grad is not None:
+                    shard.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+
+        if math.isinf(norm_type):
+            max_abs = 0.0
+            for rank in self.grid.ranks:
+                for shard in self.get_sharded_parameters(rank):
+                    if shard.grad is not None and shard.grad.numel() > 0:
+                        val = float(shard.grad.detach().abs().max().item())
+                        if val > max_abs:
+                            max_abs = val
+            global_norm = max_abs
+        else:
+            rank_pow_sums: dict[int, torch.Tensor] = {}
+            for rank in self.grid.ranks:
+                local_sum = torch.zeros(1, dtype=torch.float32, device=self.target_device)
+                for shard in self.get_sharded_parameters(rank):
+                    if shard.grad is not None:
+                        shard_norm = torch.linalg.vector_norm(
+                            shard.grad.detach().float(), ord=norm_type
+                        )
+                        local_sum = local_sum + (shard_norm**norm_type)
+                rank_pow_sums[rank] = local_sum
+
+            reduced_sums = self.communicator.all_reduce(rank_pow_sums, op="sum")
+            global_norm = float((reduced_sums[self.grid.ranks[0]] ** (1.0 / norm_type)).item())
+
+        if max_norm >= 0.0:
+            clip_coef = min(1.0, float(max_norm) / (global_norm + 1e-6))
+            if clip_coef < 1.0:
+                for rank in self.grid.ranks:
+                    for shard in self.get_sharded_parameters(rank):
+                        if shard.grad is not None:
+                            shard.grad.detach().mul_(clip_coef)
+
+        return {rank: global_norm for rank in self.grid.ranks}
+
     def create_optimizers(
         self,
         optimizer_cls: type[torch.optim.Optimizer],
@@ -189,9 +298,18 @@ class VirtualFSDP[ModelT: nn.Module]:
             for rank in self.grid.ranks
         }
 
-    def step(self, optimizers: dict[int, torch.optim.Optimizer]) -> None:
+    def step(
+        self,
+        optimizers: dict[int, torch.optim.Optimizer],
+        max_grad_norm: float | None = None,
+    ) -> dict[int, float] | None:
         """Execute sharded optimizer steps and zero gradients across all ranks."""
-        for rank in self.grid.ranks:
-            optimizers[rank].step()
-            optimizers[rank].zero_grad()
+        norms: dict[int, float] | None = None
+        if max_grad_norm is not None and max_grad_norm > 0:
+            norms = self.clip_grad_norm(max_grad_norm)
+        self._amp.step_optimizers(
+            optimizers,
+            {rank: self.get_sharded_parameters(rank) for rank in self.grid.ranks},
+        )
         self.communicator.barrier()
+        return norms

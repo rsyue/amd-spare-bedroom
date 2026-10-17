@@ -14,6 +14,7 @@ from examples.train_bert_glue import (
     SyntheticGLUEDataset,
     get_dataset,
     get_model,
+    main,
     parse_args,
 )
 
@@ -36,6 +37,8 @@ def test_parse_args_defaults() -> None:
     assert args.max_seq_length == 128
     assert args.model_name == "bert-base-uncased"
     assert args.seed == 42
+    assert args.amp == "none"
+    assert args.max_grad_norm == 1.0
 
 
 def test_parse_args_custom_and_aliases() -> None:
@@ -69,6 +72,10 @@ def test_parse_args_custom_and_aliases() -> None:
         "bert-base-cased",
         "--seed",
         "999",
+        "--amp",
+        "bf16",
+        "--max-grad-norm",
+        "0.5",
     ]
     args = parse_args(cli_args)
     assert args.ranks == 8
@@ -86,12 +93,18 @@ def test_parse_args_custom_and_aliases() -> None:
     assert args.max_seq_length == 64
     assert args.model_name == "bert-base-cased"
     assert args.seed == 999
+    assert args.amp == "bf16"
+    assert args.max_grad_norm == 0.5
 
 
 def test_parse_args_use_synthetic_alias() -> None:
-    """Verify --use-synthetic alias sets synthetic=True."""
-    args = parse_args(["--use-synthetic"])
+    """Verify --use-synthetic and --precision aliases are parsed properly."""
+    args = parse_args(["--use-synthetic", "--precision", "fp16"])
     assert args.synthetic is True
+    assert args.amp == "fp16"
+
+    args_none = parse_args(["--amp", "none"])
+    assert args_none.amp == "none"
 
 
 def test_synthetic_glue_dataset_shapes_and_keys() -> None:
@@ -163,3 +176,33 @@ def test_glue_task_mappings() -> None:
     assert GLUE_TASK_NUM_LABELS["mrpc"] == 2
     assert GLUE_TASK_NUM_LABELS["mnli"] == 3
     assert GLUE_TASK_NUM_LABELS["stsb"] == 1
+
+
+def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
+    """Verify main() executes end-to-end with AMP, seeding, and library clip_grad_norm."""
+    main(
+        [
+            "--synthetic",
+            "--use-tiny-bert",
+            "--ranks",
+            "2",
+            "--batch-size",
+            "4",
+            "--seq-len",
+            "16",
+            "--epochs",
+            "1",
+            "--max-steps",
+            "2",
+            "--amp",
+            "bf16",
+            "--device",
+            "cpu",
+            "--seed",
+            "123",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "AMP Precision Mode:   BF16" in out
+    assert "Grad Norm:" in out
+    assert "Training finished successfully" in out

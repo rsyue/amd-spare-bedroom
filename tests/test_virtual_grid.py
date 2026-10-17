@@ -1,7 +1,12 @@
 """Tests for Seam 1: VirtualGrid and VirtualDevice topology."""
 
-import pytest
+import random
 
+import numpy as np
+import pytest
+import torch
+
+from amd_spare_bedroom import resolve_amp_dtype, seed_everything
 from amd_spare_bedroom.grid import VirtualDevice, VirtualGrid
 
 
@@ -56,3 +61,74 @@ def test_virtual_grid_auto_device_detection() -> None:
     """Verify that device_type='auto' resolves to cpu or cuda."""
     grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="auto")
     assert grid.device_type in ("cpu", "cuda")
+
+
+def test_seed_everything_deterministic_across_rngs() -> None:
+    """Verify seed_everything produces reproducible Python, NumPy, and PyTorch draws."""
+    returned = seed_everything(1337)
+    assert returned == 1337
+    py_a = [random.random() for _ in range(4)]
+    np_a = np.random.rand(4)
+    th_a = torch.randn(4)
+
+    seed_everything(1337)
+    py_b = [random.random() for _ in range(4)]
+    np_b = np.random.rand(4)
+    th_b = torch.randn(4)
+
+    assert py_a == py_b
+    assert np.allclose(np_a, np_b)
+    assert torch.allclose(th_a, th_b)
+
+
+def test_virtual_grid_seed_parameter_and_per_rank_generators() -> None:
+    """Verify VirtualGrid.create(..., seed=...) seeds global and per-rank RNG generators."""
+    from amd_spare_bedroom import VirtualDDP, VirtualFSDP
+
+    grid1 = VirtualGrid.create(world_size=2, total_memory_gb=8.0, device_type="cpu", seed=2026)
+    m1_ddp = VirtualDDP(torch.nn.Linear(4, 2), grid=grid1)
+    m1_fsdp = VirtualFSDP(torch.nn.Linear(4, 2), grid=grid1)
+    r0_a = torch.randn(4, generator=grid1.get_generator(0))
+    r1_a = torch.randn(4, generator=grid1.get_generator(1))
+
+    grid2 = VirtualGrid.create(world_size=2, total_memory_gb=8.0, device_type="cpu", seed=2026)
+    m2_ddp = VirtualDDP(torch.nn.Linear(4, 2), grid=grid2)
+    m2_fsdp = VirtualFSDP(torch.nn.Linear(4, 2), grid=grid2)
+    r0_b = torch.randn(4, generator=grid2.get_generator(0))
+    r1_b = torch.randn(4, generator=grid2.get_generator(1))
+
+    assert grid1.seed == 2026
+    assert torch.allclose(r0_a, r0_b)
+    assert torch.allclose(r1_a, r1_b)
+    assert not torch.allclose(r0_a, r1_a)
+
+    for p1, p2 in zip(
+        m1_ddp.get_replica(0).parameters(), m2_ddp.get_replica(0).parameters(), strict=True
+    ):
+        assert torch.allclose(p1, p2)
+
+    full1 = m1_fsdp.get_full_parameters()
+    full2 = m2_fsdp.get_full_parameters()
+    for name in full1:
+        assert torch.allclose(full1[name], full2[name])
+
+    with pytest.raises(IndexError, match="Rank 2 out of bounds"):
+        grid1.get_generator(2)
+
+
+def test_resolve_amp_dtype_variants() -> None:
+    """Verify resolve_amp_dtype normalizes string aliases and torch.dtype values."""
+    assert resolve_amp_dtype(None) is None
+    assert resolve_amp_dtype("none") is None
+    assert resolve_amp_dtype("fp32") is None
+    assert resolve_amp_dtype("float32") is None
+    assert resolve_amp_dtype(torch.float32) is None
+    assert resolve_amp_dtype("bf16") == torch.bfloat16
+    assert resolve_amp_dtype("bfloat16") == torch.bfloat16
+    assert resolve_amp_dtype(torch.bfloat16) == torch.bfloat16
+    assert resolve_amp_dtype("fp16") == torch.float16
+    assert resolve_amp_dtype("float16") == torch.float16
+    assert resolve_amp_dtype(torch.float16) == torch.float16
+
+    with pytest.raises(ValueError, match="Unsupported AMP dtype"):
+        resolve_amp_dtype("int8")
