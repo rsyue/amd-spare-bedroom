@@ -5,6 +5,7 @@ within unified high-capacity VRAM on AMD ROCm (gfx_1151 / Strix Halo).
 """
 
 from amd_spare_bedroom.amp import AmpGradScalerState, resolve_amp_dtype
+from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.communicator import VirtualCommunicator
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
@@ -25,6 +26,7 @@ __license__ = "CC-BY-NC-ND-4.0"
 
 __all__ = [
     "AmpGradScalerState",
+    "BestCheckpointSaver",
     "ClassificationMetrics",
     "VirtualCommunicator",
     "VirtualDDP",

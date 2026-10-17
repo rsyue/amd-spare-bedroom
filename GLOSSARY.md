@@ -31,6 +31,9 @@ A deterministic, seedable dataset partitioner that produces non-overlapping batc
 ### Classification Metrics & Epoch Evaluation
 Structured evaluation scores (`ClassificationMetrics`: `accuracy`, `f1`, `precision`, `recall`, `loss`) computed via `scikit-learn` (`compute_classification_metrics`), alongside lockstep multi-rank validation evaluation (`evaluate_classification_epoch`) that reconstructs sequential dataset order via `VirtualRankSampler.unstride_and_unpad`.
 
+### Best-Metric Checkpoint Saver
+A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).
+
 ## Architecture & Concept Relationships
 
 ```mermaid
