@@ -28,6 +28,12 @@ Emulation of PyTorch's FSDP (implemented in `VirtualFSDP`). Shards model paramet
 ### Virtual Rank Sampler
 A deterministic, seedable dataset partitioner that produces non-overlapping batch splits for each Virtual Rank without data duplication or cross-rank leakage.
 
+### Classification Metrics
+Structured evaluation scores (`ClassificationMetrics`: `accuracy`, `f1`, `precision`, `recall`, `loss`) computed via `scikit-learn` (`compute_classification_metrics`) with automatic binary/multiclass resolution and zero-division protection.
+
+### Distributed Epoch Evaluation
+Lockstep multi-rank validation evaluation (`evaluate_classification_epoch`) orchestrating `VirtualDDP` and `VirtualFSDP` under `torch.no_grad()`, reconstructing sequential dataset order and stripping wrap-around padding via `VirtualRankSampler.unstride_and_unpad`.
+
 ## Architecture & Concept Relationships
 
 ```mermaid
@@ -40,4 +46,8 @@ flowchart TD
     VD --> FSDP["VirtualFSDP\n(Sharded ~1/N Memory)"]
     VC -. "Synchronizes Gradients" .-> DDP
     VC -. "Shards & Gathers" .-> FSDP
+    DDP --> EVAL["evaluate_classification_epoch\n(Distributed Validation)"]
+    FSDP --> EVAL
+    RS -. "unstride_and_unpad" .-> EVAL
+    EVAL --> METRICS["ClassificationMetrics\n(scikit-learn)"]
 ```
