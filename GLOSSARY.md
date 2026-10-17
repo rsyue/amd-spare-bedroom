@@ -28,11 +28,8 @@ Emulation of PyTorch's FSDP (implemented in `VirtualFSDP`). Shards model paramet
 ### Virtual Rank Sampler
 A deterministic, seedable dataset partitioner that produces non-overlapping batch splits for each Virtual Rank without data duplication or cross-rank leakage.
 
-### Classification Metrics
-Structured evaluation scores (`ClassificationMetrics`: `accuracy`, `f1`, `precision`, `recall`, `loss`) computed via `scikit-learn` (`compute_classification_metrics`) with automatic binary/multiclass resolution and zero-division protection.
-
-### Distributed Epoch Evaluation
-Lockstep multi-rank validation evaluation (`evaluate_classification_epoch`) orchestrating `VirtualDDP` and `VirtualFSDP` under `torch.no_grad()`, reconstructing sequential dataset order and stripping wrap-around padding via `VirtualRankSampler.unstride_and_unpad`.
+### Classification & Causal LM SFT Metrics
+Structured evaluation scores for sequence classification (`ClassificationMetrics`: `accuracy`, `f1`, `precision`, `recall`, `loss` via `compute_classification_metrics` and `evaluate_classification_epoch`) and causal language model Supervised Fine-Tuning (`SFTMetrics`: `eval_loss`, `perplexity`, and masked `token_accuracy` via `compute_sft_metrics` and `evaluate_causal_lm_epoch`), reconstructing sequential dataset order via `VirtualRankSampler.unstride_and_unpad`.
 
 ### Best-Metric Checkpoint Saver
 A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).

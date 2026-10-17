@@ -93,9 +93,10 @@ flowchart LR
 6. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
 7. **`AmpGradScalerState` & `resolve_amp_dtype`**: Coordinates Automatic Mixed Precision (`bfloat16`/`float16`) execution with autocast and dynamic loss scaling across virtual ranks.
 8. **`ClassificationMetrics` & `evaluate_classification_epoch`**: Evaluates distributed `VirtualDDP` and `VirtualFSDP` models across ranks without sampler padding distortion, computing `accuracy`, `f1`, `precision`, and `recall` via `scikit-learn`.
-9. **`BestCheckpointSaver`**: Persists a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and metadata directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification).
-10. **`HyperparameterGrid` & `WaveSchedule`**: Expands Cartesian hyperparameter candidate search spaces into deterministic `TrialConfig` instances and partitions them into sequential waves of concurrent virtual ranks.
-11. **`VirtualGridSearch`**, **`TrialResult`** & **`GridSearchResult`**: Multi-rank hyperparameter trial execution engine running isolated rank replicas, deterministic wave scheduling, and global leaderboard aggregation.
+9. **`SFTMetrics`, `evaluate_causal_lm_epoch` & `evaluate_causal_lm_model`**: Evaluates distributed and single-device Causal Language Models during Supervised Fine-Tuning (SFT), computing token-level validation cross-entropy loss, **Perplexity** ($\exp(\min(\mathcal{L}_{\text{eval}}, 20.0))$), and **Masked Next-Token Accuracy** via `scikit-learn` while ignoring `-100` prompt/padding mask tokens.
+10. **`BestCheckpointSaver`**: Persists a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and metadata directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification, `perplexity` by default for SFT).
+11. **`HyperparameterGrid` & `WaveSchedule`**: Expands Cartesian hyperparameter candidate search spaces into deterministic `TrialConfig` instances and partitions them into sequential waves of concurrent virtual ranks.
+12. **`VirtualGridSearch`**, **`TrialResult`** & **`GridSearchResult`**: Multi-rank hyperparameter trial execution engine running isolated rank replicas, deterministic wave scheduling, and global leaderboard aggregation with canonical final-line winner announcement.
 
 ---
 
@@ -135,50 +136,66 @@ uv pip install --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151 torch
 
 ## Running Examples
 
+### 1. BERT Sequence Classification on GLUE
+
 An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](examples/train_bert_glue.py), supporting both **FSDP** (parameter sharded) and **DDP** (replicated) on actual GLUE benchmarks or fast in-memory synthetic datasets:
 
 ```bash
-# Run with actual GLUE (MRPC) across 4 virtual ranks using VirtualFSDP:
-./hooks/run examples/train_bert_glue.py --parallelism fsdp --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
+# Full BERT fine-tuning across 4 ranks with VirtualFSDP, bfloat16 AMP, gradient clipping, and per-epoch F1 eval:
+./hooks/run examples/train_bert_glue.py --model-name bert-base-uncased --task-name mrpc --parallelism fsdp --ranks 4 --epochs 3 --batch-size 8 --lr 2e-5 --weight-decay 0.01 --max-grad-norm 1.0 --amp bf16 --seed 42 --max-steps 0
 
-# Run with VirtualDDP (replicated model with All-Reduce gradient synchronization):
-./hooks/run examples/train_bert_glue.py --parallelism ddp --use-tiny-bert --ranks 4 --epochs 2 --max-steps 5
+# Persist single best HuggingFace safetensors model + tokenizer checkpoint (overwritten when F1 improves):
+./hooks/run examples/train_bert_glue.py --model-name bert-base-uncased --task-name mrpc --parallelism fsdp --ranks 4 --epochs 3 --batch-size 8 --lr 2e-5 --amp bf16 --eval-metric f1 --checkpoint-dir checkpoints/best_bert_mrpc --max-steps 0
 
-# Fast smoke test using synthetic dataset (no network/download required):
-./hooks/run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
-
-# Multi-rank hyperparameter grid search (5 LRs x 5 weight decays = 25 trials in 3 waves on 10 ranks):
-./hooks/run examples/train_bert_glue.py --grid-search --ranks 10 --use-tiny-bert --checkpoint-dir checkpoints/best_bert
+# Multi-rank hyperparameter grid search (5 LRs x 5 weight decays = 25 trials in 3 waves on 10 ranks with final announcement):
+./hooks/run examples/train_bert_glue.py --grid-search --ranks 10 --task-name mrpc --epochs 2 --batch-size 8 --eval-metric f1 --checkpoint-dir checkpoints/best_bert_grid --max-steps 0
 
 # Full BERT-base sequence classification across 8 virtual ranks with FSDP on SST-2:
 ./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3 --task-name sst2
+
+# Fast smoke test using synthetic dataset (no network/download required):
+./hooks/run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
 ```
 
-Key CLI options:
+### 2. Llama 3.2 1B Supervised Fine-Tuning (SFT)
+
+A complete Causal Language Model Supervised Fine-Tuning script is provided in [`examples/train_llama_sft.py`](examples/train_llama_sft.py), supporting full-parameter instruction fine-tuning targeting `meta-llama/Llama-3.2-1B` with sharded **VirtualFSDP**, replicated **VirtualDDP**, automatic mixed precision (`bf16`), per-epoch validation perplexity and token accuracy evaluation, single best-checkpoint overwriting, and multi-rank grid search:
+
+```bash
+# Full instruction SFT on Llama 3.2 1B with VirtualFSDP across 4 virtual ranks with bfloat16 AMP:
+./hooks/run examples/train_llama_sft.py --model-name meta-llama/Llama-3.2-1B --dataset-name yahma/alpaca-cleaned --parallelism fsdp --ranks 4 --epochs 2 --batch-size 4 --lr 2e-5 --weight-decay 0.01 --max-grad-norm 1.0 --amp bf16 --eval-metric perplexity --checkpoint-dir checkpoints/best_llama_sft --max-steps 0
+
+# Multi-rank hyperparameter grid search evaluating Validation Perplexity across sequential waves:
+./hooks/run examples/train_llama_sft.py --grid-search --model-name meta-llama/Llama-3.2-1B --dataset-name yahma/alpaca-cleaned --ranks 4 --lr-grid 1e-5,2e-5,5e-5 --weight-decay-grid 0.0,0.01 --eval-metric perplexity --checkpoint-dir checkpoints/best_llama_grid --max-steps 0
+
+# Fast local smoke test with compact 2-layer Llama on synthetic data (offline, no HF credentials needed):
+./hooks/run examples/train_llama_sft.py --use-tiny-llama --synthetic --ranks 2 --epochs 2 --max-steps 2
+```
+
+### Key CLI Options
+
 - `--parallelism`: Distributed mode (`fsdp` for sharded memory, `ddp` for replicated; default: `fsdp`).
-- `--synthetic` / `--use-synthetic`: Use fast in-memory synthetic dataset instead of downloading GLUE.
-- `--task-name` / `--task`: GLUE task (`mrpc`, `sst2`, `cola`, `qqp`, `mnli`, `qnli`, `rte`, `wnli`, `stsb`; default: `mrpc`).
-- `--dataset-size`: Sample cap (default: full dataset for GLUE, 64 for synthetic).
-- `--max-seq-length` / `--seq-len`: Maximum sequence length (default: 128).
-- `--max-steps`: Maximum training steps per epoch (`<= 0` for full epoch; default: 5).
-- `--epochs`: Number of training epochs (default: 2).
-- `--batch-size`: Per-rank batch size (default: 8).
-- `--lr`: Optimizer learning rate (default: 2e-5).
-- `--weight-decay`: Weight decay for AdamW optimizer (default: 0.01).
-- `--max-grad-norm`: Maximum gradient norm threshold for clipping (default: 1.0).
+- `--synthetic` / `--use-synthetic`: Use fast in-memory synthetic dataset instead of downloading external datasets.
 - `--ranks`: Number of virtual devices/ranks to emulate in the grid (default: 4).
 - `--total-vram-gb`: Physical VRAM memory pool allocation in GB (default: 96.0).
 - `--device`: Target device type (`cuda`, `cpu`, or auto-detected; default: auto-detect).
-- `--model-name`: HuggingFace model identifier (default: `bert-base-uncased`).
-- `--use-tiny-bert`: Use compact 2-layer BERT for fast local verification.
+- `--model-name`: HuggingFace model identifier (default: `bert-base-uncased` for BERT, `meta-llama/Llama-3.2-1B` for SFT).
+- `--use-tiny-bert` / `--use-tiny-llama`: Use compact 2-layer model for fast verification and CI.
+- `--dataset-size`: Sample cap (default: full dataset, or 64 if `--synthetic`).
+- `--max-seq-length` / `--seq-len`: Maximum sequence length (default: 128 for BERT, 256 for SFT).
+- `--max-steps`: Maximum training steps per epoch (`<= 0` for full epoch; default: 5).
+- `--epochs`: Number of training epochs (default: 2).
+- `--batch-size`: Per-rank batch size (default: 8 for BERT, 4 for SFT).
+- `--lr`: Optimizer learning rate (default: 2e-5).
+- `--weight-decay`: Weight decay for AdamW optimizer (default: 0.01).
+- `--max-grad-norm`: Maximum gradient norm threshold for clipping (default: 1.0).
 - `--seed`: Random seed for data shuffling, sampling, and model initialization via `seed_everything` (default: 42).
-- `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none`).
-- `--eval-metric`: Metric to monitor for best checkpoint saving (`f1`, `accuracy`, `precision`, `recall`, `loss`; default: `f1`).
+- `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none` on CPU / `bf16` on GPU).
+- `--eval-metric`: Metric to monitor for best checkpoint saving (`f1`, `accuracy`, `precision`, `recall`, `loss`, `perplexity`, `token_accuracy`, `eval_loss`; default: `f1` for BERT, `perplexity` for SFT).
 - `--checkpoint-dir` / `--checkpoint-path`: Directory path to save the single best HuggingFace `safetensors` + tokenizer checkpoint (default: `None` for standard training, `'checkpoints/best_model'` when `--grid-search` is enabled).
 - `--grid-search`: Enable multi-rank hyperparameter grid search across sequential waves.
 - `--lr-grid`: Comma- or space-separated learning rates to search (default: `1e-5,2e-5,3e-5,5e-5,1e-4`).
 - `--weight-decay-grid`: Comma- or space-separated weight decay values to search (default: `0.0,0.001,0.01,0.05,0.1`).
-
 
 ---
 
@@ -218,6 +235,7 @@ In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vert
 - **Seam 9: Hyperparameter Search Space Expansion & Wave Scheduler (`HyperparameterGrid`, `WaveSchedule`, `TrialConfig`)**: Deterministic Cartesian trial expansion, sequential wave partitioning across virtual ranks, and idle rank tracking for partial waves.
 - **Seam 10: Multi-Rank Hyperparameter Grid Search Execution Engine (`VirtualGridSearch`, `TrialResult`, `GridSearchResult`)**: Per-rank replica and optimizer isolation, lockstep wave execution with step limits, evaluation aggregation, and single-best safetensors checkpointing.
 - **Seam 11: CLI Hyperparameter Grid Search & Winner Announcement (`--grid-search`, `format_winner_announcement`)**: Multi-rank wave execution orchestration from CLI, single best-model safetensors persistence, and canonical final-line winner announcement format.
+- **Seam 12: Causal LM SFT Pipeline & Next-Token Metrics (`SFTMetrics`, `evaluate_causal_lm_epoch`)**: Instruction fine-tuning for Llama 3.2 1B, Alpaca label masking (`ignore_index=-100`), validation perplexity, and masked token accuracy.
 
 ---
 

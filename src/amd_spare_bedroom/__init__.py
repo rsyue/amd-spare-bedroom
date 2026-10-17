@@ -29,7 +29,10 @@ from amd_spare_bedroom.grid_search import (
 )
 from amd_spare_bedroom.metrics import (
     ClassificationMetrics,
+    SFTMetrics,
     compute_classification_metrics,
+    compute_sft_metrics,
+    evaluate_causal_lm_epoch,
     evaluate_classification_epoch,
 )
 from amd_spare_bedroom.sampler import VirtualRankSampler
@@ -44,6 +47,7 @@ __all__ = [
     "GridSearchResult",
     "HyperparameterGrid",
     "ROCM_GRAD_FINITE_BOUND",
+    "SFTMetrics",
     "TrialConfig",
     "TrialResult",
     "VirtualCommunicator",
@@ -55,6 +59,8 @@ __all__ = [
     "VirtualRankSampler",
     "WaveSchedule",
     "compute_classification_metrics",
+    "compute_sft_metrics",
+    "evaluate_causal_lm_epoch",
     "evaluate_classification_epoch",
     "parse_float_grid",
     "resolve_amp_dtype",
