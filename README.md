@@ -92,6 +92,7 @@ flowchart LR
 5. **`VirtualFSDP`**: Fully Sharded Data Parallel wrapper sharding parameters, gradients, and optimizer states across virtual ranks, executing All-Gather for forward passes and Reduce-Scatter for gradients to reduce memory footprint by ~`1 / world_size`.
 6. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
 7. **`ClassificationMetrics` & `evaluate_classification_epoch`**: Evaluates distributed `VirtualDDP` and `VirtualFSDP` models across ranks without sampler padding distortion, computing `accuracy`, `f1`, `precision`, and `recall` via `scikit-learn`.
+8. **`BestCheckpointSaver`**: Persists a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and metadata directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification).
 
 ---
 
@@ -157,6 +158,7 @@ Key CLI options:
 - `--epochs`: Number of training epochs (default: 2).
 - `--batch-size`: Per-rank batch size (default: 8).
 - `--lr`: Optimizer learning rate (default: 2e-5).
+- `--weight-decay`: Weight decay for AdamW optimizer (default: 0.01).
 - `--max-grad-norm`: Maximum gradient norm threshold for clipping (default: 1.0).
 - `--ranks`: Number of virtual devices/ranks to emulate in the grid (default: 4).
 - `--total-vram-gb`: Physical VRAM memory pool allocation in GB (default: 96.0).
@@ -165,6 +167,8 @@ Key CLI options:
 - `--use-tiny-bert`: Use compact 2-layer BERT for fast local verification.
 - `--seed`: Random seed for data shuffling, sampling, and model initialization via `seed_everything` (default: 42).
 - `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none`).
+- `--eval-metric`: Metric to monitor for best checkpoint saving (`f1`, `accuracy`, `precision`, `recall`, `loss`; default: `f1`).
+- `--checkpoint-dir` / `--checkpoint-path`: Directory path to save the single best HuggingFace `safetensors` + tokenizer checkpoint.
 
 
 ---
