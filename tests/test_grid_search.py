@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
-from amd_spare_bedroom.grid import VirtualGrid
+import pytest
+import torch
+from torch import nn
+from torch.utils.data import Dataset, TensorDataset
+
+from amd_spare_bedroom.checkpoint import BestCheckpointSaver
+from amd_spare_bedroom.grid import VirtualGrid, seed_everything
 from amd_spare_bedroom.grid_search import (
+    GridSearchResult,
     HyperparameterGrid,
     TrialConfig,
+    TrialResult,
+    VirtualGridSearch,
     WaveSchedule,
 )
 
@@ -19,6 +28,58 @@ def _make_5x5_grid() -> HyperparameterGrid:
             "weight_decay": [0.0, 1e-4, 1e-3, 1e-2, 1e-1],
         }
     )
+
+
+def _make_synthetic_classification_data(
+    seed: int = 123,
+) -> tuple[nn.Module, TensorDataset, TensorDataset]:
+    seed_everything(seed)
+    base_model = nn.Sequential(
+        nn.Linear(8, 16),
+        nn.ReLU(),
+        nn.Linear(16, 2),
+    )
+    x_train = torch.randn(24, 8)
+    y_train = (x_train[:, 0] + 0.5 * x_train[:, 1] > 0).long()
+    x_val = torch.randn(16, 8)
+    y_val = (x_val[:, 0] + 0.5 * x_val[:, 1] > 0).long()
+    return base_model, TensorDataset(x_train, y_train), TensorDataset(x_val, y_val)
+
+
+class _DictLinearDataset(Dataset[dict[str, torch.Tensor]]):
+    """Mapping-batch dataset for testing dict-style forward/eval in VirtualGridSearch."""
+
+    def __init__(self, features: torch.Tensor, labels: torch.Tensor) -> None:
+        self.features = features
+        self.labels = labels
+
+    def __len__(self) -> int:
+        return int(self.features.shape[0])
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {"x": self.features[idx], "labels": self.labels[idx]}
+
+
+class _DictLinearModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Linear(8, 2)
+
+    def forward(
+        self, x: torch.Tensor, labels: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        logits = self.net(x)
+        out: dict[str, torch.Tensor] = {"logits": logits}
+        if labels is not None:
+            out["loss"] = nn.functional.cross_entropy(logits, labels)
+        return out
+
+    def save_pretrained(self, save_directory: str | Path, safe_serialization: bool = True) -> None:
+        assert safe_serialization
+        target = Path(save_directory)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "config.json").write_text('{"model_type": "dict_linear"}\n', encoding="utf-8")
+        (target / "model.safetensors").write_bytes(b"safetensors")
 
 
 def test_hyperparameter_grid_5x5_cartesian_expansion() -> None:
@@ -106,3 +167,150 @@ def test_hyperparameter_grid_validation_errors() -> None:
 
     with pytest.raises(ValueError, match="world_size must be >= 1"):
         grid.plan_waves(-2)
+
+
+def test_virtual_grid_search_world_size_invariance() -> None:
+    """Seam 1: 4 trials on world_size=4 (1 wave) vs world_size=2 (2 waves) match exactly."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=99)
+    param_grid = {
+        "lr": [1e-3, 5e-2],
+        "weight_decay": [0.0, 1e-2],
+    }
+
+    grid_4 = VirtualGrid(world_size=4, total_memory_bytes=4 * 1024**3, device_type="cpu", seed=77)
+    search_1wave = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid_4,
+        param_grid=param_grid,
+        metric_name="f1",
+        seed=77,
+    )
+    res_1wave = search_1wave.run(train_ds, val_ds, batch_size=8, epochs=2)
+
+    grid_2 = VirtualGrid(world_size=2, total_memory_bytes=2 * 1024**3, device_type="cpu", seed=77)
+    search_2waves = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid_2,
+        param_grid=param_grid,
+        metric_name="f1",
+        seed=77,
+    )
+    res_2waves = search_2waves.run(train_ds, val_ds, batch_size=8, epochs=2)
+
+    assert isinstance(res_1wave, GridSearchResult)
+    assert res_1wave.num_waves == 1
+    assert res_2waves.num_waves == 2
+    assert len(res_1wave.trials) == 4
+    assert len(res_2waves.trials) == 4
+
+    for t1, t2 in zip(res_1wave.trials, res_2waves.trials, strict=True):
+        assert isinstance(t1, TrialResult)
+        assert t1.trial == t2.trial
+        assert t1.best_epoch == t2.best_epoch
+        assert t1.best_score == pytest.approx(t2.best_score, abs=1e-6)
+        assert len(t1.epoch_metrics) == len(t2.epoch_metrics) == 2
+        for m1, m2 in zip(t1.epoch_metrics, t2.epoch_metrics, strict=True):
+            for k in m1:
+                assert m1[k] == pytest.approx(m2[k], abs=1e-6)
+
+    assert res_1wave.best_trial.trial == res_2waves.best_trial.trial
+
+
+def test_virtual_grid_search_partial_final_wave() -> None:
+    """Seam 2: 5 trials on a 3-rank VirtualGrid runs 2 waves (3 active, then 2 active)."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=101)
+    param_grid = {
+        "lr": [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
+        "weight_decay": [0.0],
+    }
+    grid_3 = VirtualGrid(world_size=3, total_memory_bytes=3 * 1024**3, device_type="cpu", seed=42)
+    search = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid_3,
+        param_grid=param_grid,
+        metric_name="accuracy",
+        seed=42,
+    )
+    result = search.run(train_ds, val_ds, batch_size=8, epochs=1)
+
+    assert result.num_waves == 2
+    assert len(result.trials) == 5
+    assert [t.wave_index for t in result.trials] == [0, 0, 0, 1, 1]
+    assert [t.assigned_rank for t in result.trials] == [0, 1, 2, 0, 1]
+
+
+def test_virtual_grid_search_distinct_hyperparameter_trajectories(tmp_path: Path) -> None:
+    """Seam 3: lr=0.0 leaves weights unchanged while lr=0.1 updates weights independently."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=202)
+    initial_params = {k: v.clone() for k, v in base_model.state_dict().items()}
+
+    grid_2 = VirtualGrid(world_size=2, total_memory_bytes=2 * 1024**3, device_type="cpu", seed=55)
+    observed_eval_weights: list[dict[str, torch.Tensor]] = []
+
+    def _custom_eval(
+        model: nn.Module,
+        eval_dataset: Dataset[object],
+        batch_size: int,
+        device: torch.device,
+        amp_dtype: torch.dtype | None,
+    ) -> dict[str, float]:
+        assert not model.training
+        assert len(eval_dataset) == 16  # type: ignore[arg-type]
+        assert batch_size == 8
+        assert device == torch.device("cpu")
+        assert amp_dtype is None
+        snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        observed_eval_weights.append(snapshot)
+        max_delta = max(
+            float((snapshot[k] - initial_params[k]).abs().max().item()) for k in initial_params
+        )
+        return {"f1": max_delta, "loss": 1.0 / (1.0 + max_delta)}
+
+    search = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid_2,
+        param_grid={"lr": [0.0, 0.1], "weight_decay": [0.0]},
+        metric_name="f1",
+        seed=55,
+    )
+    result = search.run(
+        train_ds,
+        val_ds,
+        batch_size=8,
+        epochs=1,
+        max_steps=2,
+        eval_fn=_custom_eval,
+    )
+
+    assert len(observed_eval_weights) == 2
+    # Rank 0 (lr=0.0) weights must equal initial weights exactly
+    for k, init_tensor in initial_params.items():
+        assert torch.allclose(observed_eval_weights[0][k], init_tensor, atol=1e-7)
+
+    # Rank 1 (lr=0.1) weights must have diverged from initial weights
+    assert any(
+        not torch.allclose(observed_eval_weights[1][k], init_tensor, atol=1e-5)
+        for k, init_tensor in initial_params.items()
+    )
+    assert result.trials[0].best_score == pytest.approx(0.0, abs=1e-7)
+    assert result.trials[1].best_score > 0.0
+    assert result.best_trial == result.trials[1]
+
+    # Also verify mapping-batch dataset and BestCheckpointSaver integration
+    seed_everything(303)
+    dict_model = _DictLinearModel()
+    x = torch.randn(16, 8)
+    y = (x[:, 0] > 0).long()
+    dict_ds = _DictLinearDataset(x, y)
+    saver = BestCheckpointSaver(tmp_path / "ckpt", metric_name="loss", mode="min")
+    dict_search = VirtualGridSearch(
+        base_model=dict_model,
+        grid=grid_2,
+        param_grid=HyperparameterGrid({"lr": [1e-4, 5e-2]}),
+        metric_name="loss",
+        checkpoint_saver=saver,
+        seed=55,
+    )
+    dict_res = dict_search.run(dict_ds, dict_ds, batch_size=8, epochs=1)
+    assert not dict_res.higher_is_better
+    assert saver.best_score == pytest.approx(dict_res.best_trial.best_score, abs=1e-6)
