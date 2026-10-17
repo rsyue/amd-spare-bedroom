@@ -34,6 +34,9 @@ Structured evaluation scores (`ClassificationMetrics`: `accuracy`, `f1`, `precis
 ### Best-Metric Checkpoint Saver
 A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).
 
+### Virtual Grid Search
+A parallel hyperparameter exploration mode (`HyperparameterGrid`, `WaveSchedule`, `TrialConfig`) in which Cartesian hyperparameter trials are scheduled across a `VirtualGrid`'s virtual ranks in sequential execution waves of up to `world_size` concurrent trials.
+
 ## Architecture & Concept Relationships
 
 ```mermaid
