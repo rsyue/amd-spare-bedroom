@@ -147,6 +147,9 @@ An end-to-end multi-rank BERT classification training script is provided in [`ex
 # Fast smoke test using synthetic dataset (no network/download required):
 ./hooks/run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
 
+# Multi-rank hyperparameter grid search (5 LRs x 5 weight decays = 25 trials in 3 waves on 10 ranks):
+./hooks/run examples/train_bert_glue.py --grid-search --ranks 10 --use-tiny-bert --checkpoint-dir checkpoints/best_bert
+
 # Full BERT-base sequence classification across 8 virtual ranks with FSDP on SST-2:
 ./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3 --task-name sst2
 ```
@@ -172,6 +175,9 @@ Key CLI options:
 - `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none`).
 - `--eval-metric`: Metric to monitor for best checkpoint saving (`f1`, `accuracy`, `precision`, `recall`, `loss`; default: `f1`).
 - `--checkpoint-dir` / `--checkpoint-path`: Directory path to save the single best HuggingFace `safetensors` + tokenizer checkpoint.
+- `--grid-search`: Enable multi-rank hyperparameter grid search across sequential waves.
+- `--lr-grid`: Comma- or space-separated learning rates to search (default: `1e-5,2e-5,3e-5,5e-5,1e-4`).
+- `--weight-decay-grid`: Comma- or space-separated weight decay values to search (default: `0.0,0.001,0.01,0.05,0.1`).
 
 
 ---
