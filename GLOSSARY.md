@@ -34,6 +34,9 @@ Structured evaluation scores (`ClassificationMetrics`: `accuracy`, `f1`, `precis
 ### Distributed Epoch Evaluation
 Lockstep multi-rank validation evaluation (`evaluate_classification_epoch`) orchestrating `VirtualDDP` and `VirtualFSDP` under `torch.no_grad()`, reconstructing sequential dataset order and stripping wrap-around padding via `VirtualRankSampler.unstride_and_unpad`.
 
+### Best-Metric Checkpoint Saver
+A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).
+
 ## Architecture & Concept Relationships
 
 ```mermaid

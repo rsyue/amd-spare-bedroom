@@ -15,14 +15,19 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from datasets import load_dataset
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    PreTrainedTokenizerFast,
 )
 
 from amd_spare_bedroom import seed_everything
+from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid
@@ -195,6 +200,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="Learning rate (default: 2e-5)",
     )
     parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.01,
+        help="Weight decay for AdamW optimizer (default: 0.01)",
+    )
+    parser.add_argument(
         "--max-grad-norm",
         type=float,
         default=1.0,
@@ -276,6 +287,21 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         choices=["none", "fp32", "float32", "bf16", "bfloat16", "fp16", "float16"],
         help="Automatic mixed precision mode ('none'/'fp32', 'bf16'/'bfloat16', 'fp16'/'float16'; default: 'none')",
     )
+    parser.add_argument(
+        "--eval-metric",
+        type=str,
+        default="f1",
+        choices=["f1", "accuracy", "precision", "recall", "loss", "eval_loss"],
+        help="Evaluation metric to monitor for best checkpoint saving (default: 'f1')",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        "--checkpoint-path",
+        type=str,
+        default=None,
+        dest="checkpoint_dir",
+        help="Directory path to save the single best HuggingFace safetensors + tokenizer checkpoint",
+    )
     parsed = parser.parse_args(args)
     if parsed.max_grad_norm is not None:
         if not math.isfinite(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
@@ -285,6 +311,34 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     if not (0 <= parsed.seed < 2**32):
         raise ValueError(f"seed must be between 0 and {2**32 - 1}, got {parsed.seed}")
     return parsed
+
+
+def get_tokenizer(
+    model_name: str = "bert-base-uncased",
+    synthetic: bool = False,
+) -> Any:
+    """Instantiate a BERT tokenizer (or a self-contained offline tokenizer when synthetic=True)."""
+    if synthetic:
+        vocab = {
+            "[PAD]": 0,
+            "[UNK]": 100,
+            "[CLS]": 101,
+            "[SEP]": 102,
+            "[MASK]": 103,
+            "amd": 104,
+            "rocm": 105,
+        }
+        tok = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+        tok.pre_tokenizer = Whitespace()
+        return PreTrainedTokenizerFast(  # type: ignore[no-untyped-call]
+            tokenizer_object=tok,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+    return AutoTokenizer.from_pretrained(model_name)
 
 
 def get_model(
@@ -377,7 +431,9 @@ def main(argv: list[str] | None = None) -> None:
         dist_model = VirtualDDP(base_model, grid=grid, amp_dtype=args.amp)
 
     dist_model.train()
-    optimizers = dist_model.create_optimizers(torch.optim.AdamW, lr=args.lr)
+    optimizers = dist_model.create_optimizers(
+        torch.optim.AdamW, lr=args.lr, weight_decay=args.weight_decay
+    )
 
     # 3. Create Dataset and Rank-Sharded Samplers
     dataset = get_dataset(
@@ -423,6 +479,15 @@ def main(argv: list[str] | None = None) -> None:
     max_steps_str = f"max {args.max_steps} steps/epoch" if has_max_steps else "full epoch"
     print(f"[*] Training configured for {args.epochs} epoch(s), {max_steps_str}")
     print("=" * 70)
+
+    checkpoint_saver: BestCheckpointSaver | None = None
+    if args.checkpoint_dir is not None:
+        tokenizer = get_tokenizer(args.model_name, synthetic=args.synthetic)
+        checkpoint_saver = BestCheckpointSaver(
+            checkpoint_dir=args.checkpoint_dir,
+            metric_name=args.eval_metric,
+            tokenizer=tokenizer,
+        )
 
     # 4. Training Loop with Lockstep All-Reduce Synchronization
     for epoch in range(args.epochs):
@@ -523,6 +588,18 @@ def main(argv: list[str] | None = None) -> None:
                 f"F1: {eval_metrics.f1:.4f} | Precision: {eval_metrics.precision:.4f} | "
                 f"Recall: {eval_metrics.recall:.4f} ---"
             )
+            if checkpoint_saver is not None:
+                saved = checkpoint_saver.save_if_best(
+                    model=dist_model,
+                    metrics=eval_metrics,
+                    epoch=epoch + 1,
+                    hyperparameters={"lr": args.lr, "weight_decay": args.weight_decay},
+                )
+                if saved:
+                    print(
+                        f"[*] Saved new best checkpoint to '{args.checkpoint_dir}' "
+                        f"({args.eval_metric}={checkpoint_saver.best_score:.4f})"
+                    )
         else:
             print(
                 f"--- Epoch {epoch + 1} Eval skipped: Task '{args.task_name}' is a regression benchmark (num_labels=1) ---"
