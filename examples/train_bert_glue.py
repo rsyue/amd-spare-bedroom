@@ -25,6 +25,7 @@ from transformers import (
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
+from amd_spare_bedroom.metrics import evaluate_classification_epoch
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
 GLUE_TASK_TO_KEYS: dict[str, tuple[str, ...]] = {
@@ -103,6 +104,7 @@ def get_dataset(
     max_seq_length: int = 128,
     dataset_size: int | None = None,
     synthetic: bool = False,
+    split: str = "train",
 ) -> Dataset[dict[str, torch.Tensor]]:
     """Load actual GLUE dataset (tokenized) or create synthetic dataset for smoke tests."""
     num_labels = GLUE_TASK_NUM_LABELS.get(task_name, 2)
@@ -115,12 +117,13 @@ def get_dataset(
             num_labels=num_labels,
         )
 
-    print(f"[*] Loading actual GLUE dataset for task '{task_name}'...")
+    hf_split = "validation_matched" if (split == "validation" and task_name == "mnli") else split
+    print(f"[*] Loading actual GLUE dataset for task '{task_name}' (split='{hf_split}')...")
     try:
         try:
-            raw_dataset = load_dataset("nyu-mll/glue", task_name, split="train")
+            raw_dataset = load_dataset("nyu-mll/glue", task_name, split=hf_split)
         except Exception:
-            raw_dataset = load_dataset("glue", task_name, split="train")
+            raw_dataset = load_dataset("glue", task_name, split=hf_split)
     except Exception as exc:
         print(f"[!] Error loading GLUE dataset '{task_name}': {exc}")
         print("[!] Tip: For offline runs or fast verification, use --synthetic")
@@ -374,6 +377,15 @@ def main(argv: list[str] | None = None) -> None:
         max_seq_length=args.max_seq_length,
         dataset_size=args.dataset_size,
         synthetic=args.synthetic,
+        split="train",
+    )
+    eval_dataset = get_dataset(
+        task_name=args.task_name,
+        model_name=args.model_name,
+        max_seq_length=args.max_seq_length,
+        dataset_size=args.dataset_size,
+        synthetic=args.synthetic,
+        split="validation",
     )
 
     rank_loaders: dict[int, DataLoader[dict[str, torch.Tensor]]] = {}
@@ -487,6 +499,18 @@ def main(argv: list[str] | None = None) -> None:
 
         epoch_time = time.perf_counter() - epoch_start
         print(f"--- Epoch {epoch + 1} completed in {epoch_time:.2f}s ---")
+
+        eval_metrics = evaluate_classification_epoch(
+            dist_model=dist_model,
+            eval_dataset=eval_dataset,
+            batch_size=args.batch_size,
+        )
+        eval_loss = eval_metrics.loss if eval_metrics.loss is not None else 0.0
+        print(
+            f"--- Epoch {epoch + 1} Eval | Loss: {eval_loss:.4f} | Acc: {eval_metrics.accuracy:.4f} | "
+            f"F1: {eval_metrics.f1:.4f} | Precision: {eval_metrics.precision:.4f} | "
+            f"Recall: {eval_metrics.recall:.4f} ---"
+        )
 
     print("\n" + "=" * 70)
     print(

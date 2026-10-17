@@ -179,7 +179,7 @@ def test_glue_task_mappings() -> None:
 
 
 def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
-    """Verify main() executes end-to-end with AMP, seeding, and library clip_grad_norm."""
+    """Verify main() executes end-to-end with AMP, seeding, clip_grad_norm, and per-epoch eval."""
     main(
         [
             "--synthetic",
@@ -188,10 +188,12 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
             "2",
             "--batch-size",
             "4",
+            "--dataset-size",
+            "8",
             "--seq-len",
             "16",
             "--epochs",
-            "1",
+            "2",
             "--max-steps",
             "2",
             "--amp",
@@ -205,4 +207,10 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
     out = capsys.readouterr().out
     assert "AMP Precision Mode:   BF16" in out
     assert "Grad Norm:" in out
+    assert "--- Epoch 1 Eval | Loss:" in out
+    assert "--- Epoch 2 Eval | Loss:" in out
+    assert "| Acc:" in out
+    assert "| F1:" in out
+    assert "| Precision:" in out
+    assert "| Recall:" in out
     assert "Training finished successfully" in out
