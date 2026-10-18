@@ -7,7 +7,7 @@ on AMD ROCm (targeting gfx_1151 / Radeon 8060S / Strix Halo).
 from __future__ import annotations
 
 import argparse
-import sys
+import math
 import time
 from collections.abc import Sized
 from typing import Any, cast
@@ -22,6 +22,7 @@ from transformers import (
     AutoTokenizer,
 )
 
+from amd_spare_bedroom import seed_everything
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid
@@ -263,7 +264,24 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=42,
         help="Random seed for data shuffling and sampling (default: 42)",
     )
-    return parser.parse_args(args)
+    parser.add_argument(
+        "--amp",
+        "--precision",
+        type=str,
+        default="none",
+        dest="amp",
+        choices=["none", "fp32", "float32", "bf16", "bfloat16", "fp16", "float16"],
+        help="Automatic mixed precision mode ('none'/'fp32', 'bf16'/'bfloat16', 'fp16'/'float16'; default: 'none')",
+    )
+    parsed = parser.parse_args(args)
+    if parsed.max_grad_norm is not None:
+        if not math.isfinite(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
+            raise ValueError(
+                f"max-grad-norm must be a non-negative finite float, got {parsed.max_grad_norm}"
+            )
+    if not (0 <= parsed.seed < 2**32):
+        raise ValueError(f"seed must be between 0 and {2**32 - 1}, got {parsed.seed}")
+    return parsed
 
 
 def get_model(
@@ -298,10 +316,10 @@ def get_model(
     )
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
-    torch.manual_seed(args.seed)
+    seed_everything(args.seed)
 
     print("=" * 70)
     print(f"AMD SPARE BEDROOM: Virtual {args.parallelism.upper()} Training on ROCm (gfx_1151)")
@@ -312,6 +330,7 @@ def main() -> None:
         world_size=args.ranks,
         total_memory_gb=args.total_vram_gb,
         device_type=args.device,
+        seed=args.seed,
     )
 
     per_rank_gb = grid.per_rank_memory_bytes / (1024**3)
@@ -319,6 +338,7 @@ def main() -> None:
     print(f"[*] Virtual World Size:   {grid.world_size} ranks")
     print(f"[*] Per-Rank Budget:      {per_rank_gb:.2f} GB per virtual device")
     print(f"[*] Active Device Type:   {grid.device_type.upper()}")
+    print(f"[*] AMP Precision Mode:   {args.amp.upper()}")
 
     if grid.device_type == "cuda" and torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
@@ -341,7 +361,7 @@ def main() -> None:
         print(
             f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualFSDP (Sharded)..."
         )
-        dist_model: Any = VirtualFSDP(base_model, grid=grid)
+        dist_model: Any = VirtualFSDP(base_model, grid=grid, amp_dtype=args.amp)
         per_rank_params = dist_model.get_rank_parameter_numel(0)
         pct = (per_rank_params / param_count) * 100
         print(
@@ -351,8 +371,9 @@ def main() -> None:
         print(
             f"[*] Wrapping model across {grid.world_size} virtual ranks via VirtualDDP (Replicated)..."
         )
-        dist_model = VirtualDDP(base_model, grid=grid)
+        dist_model = VirtualDDP(base_model, grid=grid, amp_dtype=args.amp)
 
+    dist_model.train()
     optimizers = dist_model.create_optimizers(torch.optim.AdamW, lr=args.lr)
 
     # 3. Create Dataset and Rank-Sharded Samplers
@@ -394,6 +415,7 @@ def main() -> None:
     # 4. Training Loop with Lockstep All-Reduce Synchronization
     for epoch in range(args.epochs):
         print(f"\n>>> Epoch {epoch + 1}/{args.epochs}")
+        dist_model.train()
         for rank in grid.ranks:
             samplers[rank].set_epoch(epoch)
 
@@ -433,42 +455,26 @@ def main() -> None:
                 loss = outputs.loss
                 step_losses[rank] = float(loss.item())
 
-                # Backward pass computes local gradients
-                loss.backward()
+                # Backward pass computes local gradients (with GradScaler when FP16 AMP is active)
+                dist_model.backward(rank, loss)
 
             # B. Collective Gradient Synchronization (All-Reduce for DDP, Reduce-Scatter for FSDP)
             dist_model.sync_gradients()
 
-            # Clip gradients to ensure numerical stability across virtual ranks
-            if args.max_grad_norm > 0:
-                for rank in grid.ranks:
-                    if args.parallelism == "fsdp":
-                        sharded_params = dist_model.get_sharded_parameters(rank)
-                        for p in sharded_params:
-                            if p.grad is not None:
-                                p.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
-                        torch.nn.utils.clip_grad_norm_(
-                            sharded_params,
-                            args.max_grad_norm,
-                        )
-                    else:
-                        replica_params = list(dist_model.replicas[rank].parameters())
-                        for p in replica_params:
-                            if p.grad is not None:
-                                p.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
-                        torch.nn.utils.clip_grad_norm_(
-                            replica_params,
-                            args.max_grad_norm,
-                        )
-
-            # C. Lockstep Optimizer Step
-            dist_model.step(optimizers)
+            # C. Lockstep Optimizer Step with Gradient Clipping
+            grad_norm_val = 0.0
+            grad_norms = dist_model.step(
+                optimizers,
+                max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+            )
+            if grad_norms is not None:
+                grad_norm_val = grad_norms[grid.ranks[0]]
 
             # D. Verify Multi-Rank Weight Parity
-            if hasattr(dist_model, "assert_parameters_synced"):
-                synced = dist_model.assert_parameters_synced()
-                if not synced:
-                    print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
+            synced = dist_model.assert_parameters_synced()
+            if not synced:
+                print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
+                if hasattr(dist_model, "replicas"):
                     ref_p = list(dist_model.replicas[grid.ranks[0]].named_parameters())
                     for r in grid.ranks[1:]:
                         rep_p = dict(dist_model.replicas[r].named_parameters())
@@ -478,14 +484,16 @@ def main() -> None:
                                 print(
                                     f"    Desync on Rank {r} for {n}: max diff = {(p0 - pr).abs().max().item()}, p0 nan={torch.isnan(p0).any().item()}, pr nan={torch.isnan(pr).any().item()}"
                                 )
-                    sys.exit(1)
+                raise RuntimeError(
+                    f"Parameter desynchronization detected at step {step} across virtual ranks"
+                )
 
             avg_loss = sum(step_losses.values()) / len(step_losses)
             loss_breakdown = ", ".join(
                 f"R{rank_id}: {loss_val:.4f}" for rank_id, loss_val in step_losses.items()
             )
             print(
-                f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Ranks: [{loss_breakdown}] | Mode: {args.parallelism.upper()}"
+                f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Grad Norm: {grad_norm_val:.4f} | Ranks: [{loss_breakdown}] | Mode: {args.parallelism.upper()}"
             )
 
         epoch_time = time.perf_counter() - epoch_start
@@ -495,11 +503,7 @@ def main() -> None:
     print(
         f"Training finished successfully across all emulated ranks using {args.parallelism.upper()}!"
     )
-    if hasattr(dist_model, "assert_parameters_synced"):
-        print(f"Final parameter lockstep check: {dist_model.assert_parameters_synced()}")
-    else:
-        full_p = dist_model.get_full_parameters()
-        print(f"Final sharded parameter reconstruction check: {len(full_p)} parameters active")
+    print(f"Final parameter lockstep check: {dist_model.assert_parameters_synced()}")
     print("=" * 70)
 
 
