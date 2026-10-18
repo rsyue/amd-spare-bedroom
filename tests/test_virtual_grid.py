@@ -135,12 +135,27 @@ def test_resolve_amp_dtype_variants() -> None:
 
 
 def test_seed_everything_bounds_validation() -> None:
-    """Verify seed_everything rejects negative seeds and integers exceeding 32-bit unsigned range."""
+    """Verify seed_everything rejects negative seeds, floats, booleans, and 32-bit overflow."""
     with pytest.raises(ValueError, match="Seed must be an integer between 0 and 4294967295"):
         seed_everything(-1)
 
     with pytest.raises(ValueError, match="Seed must be an integer between 0 and 4294967295"):
         seed_everything(2**32)
+
+    with pytest.raises(ValueError, match="Seed must be an integer between 0 and 4294967295"):
+        seed_everything(42.5)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Seed must be an integer between 0 and 4294967295"):
+        seed_everything(True)
+
+
+def test_virtual_grid_memory_validations() -> None:
+    """Verify VirtualGrid rejects zero or negative total memory allocations."""
+    with pytest.raises(ValueError, match="total_memory_bytes must be > 0"):
+        VirtualGrid(world_size=2, total_memory_bytes=0, device_type="cpu")
+
+    with pytest.raises(ValueError, match="total_memory_bytes must be > 0"):
+        VirtualGrid(world_size=2, total_memory_bytes=-1024, device_type="cpu")
 
 
 def test_virtual_grid_generator_device_alignment() -> None:

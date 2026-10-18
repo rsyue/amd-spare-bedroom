@@ -382,3 +382,71 @@ def test_virtual_ddp_gradient_presence_mismatch_raises() -> None:
 
     with pytest.raises(RuntimeError, match="Gradient presence mismatch for parameter 'fc.weight'"):
         ddp.sync_gradients()
+
+    # Verify unscaled state was NOT prematurely set
+    assert ddp._amp._grads_unscaled is False
+
+
+def test_virtual_ddp_clip_grad_norm_and_step_before_sync_raises() -> None:
+    """Verify clip_grad_norm and step raise RuntimeError if called before sync_gradients."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleModel()
+    ddp = VirtualDDP(model, grid=grid)
+    optimizers = ddp.create_optimizers(torch.optim.SGD, lr=0.01)
+
+    x = torch.randn(2, 4)
+    ddp.backward(0, ddp.forward(0, x).sum())
+    ddp.backward(1, ddp.forward(1, x).sum())
+
+    with pytest.raises(
+        RuntimeError,
+        match="VirtualDDP.clip_grad_norm\\(\\) cannot be called before sync_gradients",
+    ):
+        ddp.clip_grad_norm(max_norm=1.0)
+
+    with pytest.raises(
+        RuntimeError,
+        match="VirtualDDP.step\\(\\) cannot be called before sync_gradients",
+    ):
+        ddp.step(optimizers)
+
+
+def test_virtual_ddp_empty_grad_clip() -> None:
+    """Verify clip_grad_norm returns 0.0 when no parameters have gradients."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleModel()
+    ddp = VirtualDDP(model, grid=grid)
+
+    ddp.sync_gradients()
+    norms = ddp.clip_grad_norm(max_norm=1.0)
+    assert norms == {0: 0.0, 1: 0.0}
+
+
+def test_virtual_ddp_eval_forward_while_training_preserves_state() -> None:
+    """Verify eval_forward disables dropout during execution and restores training mode."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+
+    class DropoutModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drop = nn.Dropout(p=0.999)
+            self.fc = nn.Linear(10, 10)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.fc(self.drop(x)))
+
+    model = DropoutModel()
+    ddp = VirtualDDP(model, grid=grid)
+    ddp.train()
+    assert ddp.is_training is True
+
+    x = torch.ones(5, 10)
+    # Under eval_forward, dropout is inactive so identical non-zero output is produced
+    out1 = ddp.eval_forward(0, x)
+    out2 = ddp.eval_forward(0, x)
+    assert torch.allclose(out1, out2)
+
+    # After eval_forward completes, training state and dropout must be restored
+    assert ddp.is_training is True
+    assert ddp.get_replica(0).training is True
+    assert ddp.get_replica(0).drop.training is True

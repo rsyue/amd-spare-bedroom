@@ -104,6 +104,7 @@ class VirtualFSDP[ModelT: nn.Module]:
         self._exec_replicas: dict[int, ModelT] = {
             rank: copy.deepcopy(self._skeleton) for rank in self.grid.ranks
         }
+        self._gradients_synced: bool = False
 
     @property
     def is_training(self) -> bool:
@@ -188,6 +189,7 @@ class VirtualFSDP[ModelT: nn.Module]:
         """Execute a backward pass on rank, scaling loss when FP16 GradScaler is active."""
         if rank not in self._exec_replicas:
             raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
+        self._gradients_synced = False
         self._amp.backward(rank, loss)
 
     def sync_gradients(self) -> None:
@@ -196,15 +198,11 @@ class VirtualFSDP[ModelT: nn.Module]:
         Unscales FP16 gradients (detecting overflow prior to sanitization) and sanitizes
         non-finite gradients (NaN/Inf) prior to reduction.
         """
-        self._amp.unscale_and_check_finite(
-            {rank: self._exec_replicas[rank].parameters() for rank in self.grid.ranks}
-        )
-
         rank_params = {
             rank: dict(self._exec_replicas[rank].named_parameters()) for rank in self.grid.ranks
         }
 
-        for name, meta in self.metadata.items():
+        for name in self.metadata:
             grads_present = [rank_params[r][name].grad is not None for r in self.grid.ranks]
             if not any(grads_present):
                 continue
@@ -215,6 +213,15 @@ class VirtualFSDP[ModelT: nn.Module]:
                 raise RuntimeError(
                     f"Gradient presence mismatch for parameter '{name}': missing on ranks {missing}"
                 )
+
+        self._amp.unscale_and_check_finite(
+            {rank: self._exec_replicas[rank].parameters() for rank in self.grid.ranks}
+        )
+
+        for name, meta in self.metadata.items():
+            grads_present = [rank_params[r][name].grad is not None for r in self.grid.ranks]
+            if not any(grads_present):
+                continue
 
             full_grads_by_rank: dict[int, torch.Tensor] = {}
             for rank in self.grid.ranks:
@@ -241,11 +248,13 @@ class VirtualFSDP[ModelT: nn.Module]:
 
             # Assign scattered gradient to the rank's sharded parameter
             for rank in self.grid.ranks:
-                self.rank_shards[rank][name].grad = scattered_grads[rank].clone()
+                self.rank_shards[rank][name].grad = scattered_grads[rank]
 
             # Free gradient memory from the un-sharded execution models
             for rank in self.grid.ranks:
                 rank_params[rank][name].grad = None
+
+        self._gradients_synced = True
 
     def clip_grad_norm(
         self,
@@ -257,25 +266,8 @@ class VirtualFSDP[ModelT: nn.Module]:
         Returns:
             Mapping from rank ID to the pre-clipping global gradient norm.
         """
-        has_shard_grads = any(
-            p.grad is not None
-            for rank in self.grid.ranks
-            for p in self.get_sharded_parameters(rank)
-        )
-        has_exec_grads = any(
-            p.grad is not None
-            for rank in self.grid.ranks
-            for p in self._exec_replicas[rank].parameters()
-        )
-        if not has_shard_grads and has_exec_grads:
-            raise RuntimeError(
-                "VirtualFSDP.clip_grad_norm() cannot be called before sync_gradients(). "
-                "Sharded parameter gradients have not yet been reduce-scattered."
-            )
-
-        if max_norm is not None:
-            if math.isnan(max_norm) or max_norm < 0.0:
-                raise ValueError(f"max_norm must be a non-negative finite float, got {max_norm}")
+        if max_norm is None or not math.isfinite(max_norm) or max_norm < 0.0:
+            raise ValueError(f"max_norm must be a non-negative finite float, got {max_norm}")
 
         try:
             norm_type_f = float(norm_type)
@@ -283,6 +275,15 @@ class VirtualFSDP[ModelT: nn.Module]:
             raise ValueError(
                 f"norm_type must be a valid float or float string, got {norm_type!r}"
             ) from e
+
+        if not math.isinf(norm_type_f) and norm_type_f <= 0:
+            raise ValueError(f"norm_type must be greater than 0, got {norm_type_f}")
+
+        if not self._gradients_synced:
+            raise RuntimeError(
+                "VirtualFSDP.clip_grad_norm() cannot be called before sync_gradients(). "
+                "Sharded parameter gradients have not yet been reduce-scattered."
+            )
 
         self._amp.unscale_and_check_finite(
             {rank: self.get_sharded_parameters(rank) for rank in self.grid.ranks}
@@ -307,15 +308,20 @@ class VirtualFSDP[ModelT: nn.Module]:
             else:
                 min_abs = float("inf")
                 for rank in self.grid.ranks:
-                    for shard in self.get_sharded_parameters(rank):
+                    for name, shard in self.rank_shards[rank].items():
                         if shard.grad is not None and shard.grad.numel() > 0:
-                            val = float(shard.grad.detach().abs().min().item())
-                            if val < min_abs:
-                                min_abs = val
+                            meta = self.metadata[name]
+                            grad = (
+                                shard.grad[: -meta.padding_len]
+                                if rank == self.grid.ranks[-1] and meta.padding_len > 0
+                                else shard.grad
+                            )
+                            if grad.numel() > 0:
+                                val = float(grad.detach().abs().min().item())
+                                if val < min_abs:
+                                    min_abs = val
                 global_norm = 0.0 if math.isinf(min_abs) else min_abs
             self.communicator.barrier()
-        elif norm_type_f <= 0:
-            raise ValueError(f"norm_type must be greater than 0, got {norm_type_f}")
         else:
             rank_pow_sums: dict[int, torch.Tensor] = {}
             for rank in self.grid.ranks:
@@ -323,7 +329,7 @@ class VirtualFSDP[ModelT: nn.Module]:
                 for shard in self.get_sharded_parameters(rank):
                     if shard.grad is not None:
                         shard_norm = torch.linalg.vector_norm(
-                            shard.grad.detach().float(), ord=norm_type_f
+                            shard.grad.detach(), ord=norm_type_f, dtype=torch.float32
                         )
                         local_sum = local_sum + (shard_norm**norm_type_f)
                 rank_pow_sums[rank] = local_sum
@@ -358,6 +364,12 @@ class VirtualFSDP[ModelT: nn.Module]:
         max_grad_norm: float | None = None,
     ) -> dict[int, float] | None:
         """Execute sharded optimizer steps and zero gradients across all ranks."""
+        if not self._gradients_synced:
+            raise RuntimeError(
+                "VirtualFSDP.step() cannot be called before sync_gradients(). "
+                "Sharded parameter gradients have not yet been reduce-scattered."
+            )
+
         norms: dict[int, float] | None = None
         if max_grad_norm is not None and max_grad_norm > 0:
             norms = self.clip_grad_norm(max_grad_norm)
@@ -366,10 +378,15 @@ class VirtualFSDP[ModelT: nn.Module]:
             {rank: self.get_sharded_parameters(rank) for rank in self.grid.ranks},
         )
         self.communicator.barrier()
+        self._gradients_synced = False
         return norms
 
     def assert_parameters_synced(self, atol: float = 1e-6) -> bool:
-        """Assert that all parameter shards are finite and synchronized."""
+        """Assert that all parameter shards are finite and synchronized.
+
+        Note: atol is accepted for signature parity with VirtualDDP.
+        """
+        _ = atol
         for rank in self.grid.ranks:
             for shard in self.get_sharded_parameters(rank):
                 if not bool(torch.isfinite(shard.data).all().item()):

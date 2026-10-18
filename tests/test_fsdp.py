@@ -1,6 +1,7 @@
 """Tests for Seam 5B: VirtualFSDP parameter sharding, all-gather, and reduce-scatter."""
 
 import copy
+import math
 from typing import cast
 
 import pytest
@@ -363,6 +364,13 @@ def test_virtual_fsdp_clip_grad_norm_before_sync_raises() -> None:
     ):
         fsdp.clip_grad_norm(max_norm=1.0)
 
+    optimizers = fsdp.create_optimizers(torch.optim.SGD, lr=0.01)
+    with pytest.raises(
+        RuntimeError,
+        match="VirtualFSDP.step\\(\\) cannot be called before sync_gradients",
+    ):
+        fsdp.step(optimizers)
+
 
 def test_virtual_fsdp_clip_grad_norm_infinite_and_validations() -> None:
     """Verify infinite norms (+inf, -inf, string 'inf') and validation checks."""
@@ -418,3 +426,74 @@ def test_virtual_fsdp_gradient_presence_mismatch_raises() -> None:
 
     with pytest.raises(RuntimeError, match="Gradient presence mismatch for parameter 'fc.weight'"):
         fsdp.sync_gradients()
+
+    # Verify unscaled state was NOT prematurely set
+    assert fsdp._amp._grads_unscaled is False
+
+
+def test_virtual_fsdp_padded_shard_negative_inf_norm_matches_ddp() -> None:
+    """Verify negative infinity norm ignores shard padding zeros and matches DDP global norm."""
+    from amd_spare_bedroom import VirtualDDP
+
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+
+    # 5 parameters across 2 ranks -> shard_len = 3, padded_len = 6, padding_len = 1 on rank 1
+    model = nn.Linear(5, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]]))
+
+    fsdp = VirtualFSDP(model, grid=grid)
+    ddp = VirtualDDP(model, grid=grid)
+
+    x0 = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0]])
+    x1 = torch.tensor([[2.0, 2.0, 2.0, 2.0, 2.0]])
+    y = torch.tensor([[0.0]])
+
+    # Backward on FSDP
+    loss0_f = nn.functional.mse_loss(fsdp.forward(0, x0), y)
+    loss1_f = nn.functional.mse_loss(fsdp.forward(1, x1), y)
+    fsdp.backward(0, loss0_f)
+    fsdp.backward(1, loss1_f)
+    fsdp.sync_gradients()
+
+    # Backward on DDP
+    loss0_d = nn.functional.mse_loss(ddp.forward(0, x0), y)
+    loss1_d = nn.functional.mse_loss(ddp.forward(1, x1), y)
+    ddp.backward(0, loss0_d)
+    ddp.backward(1, loss1_d)
+    ddp.sync_gradients()
+
+    fsdp_neg_inf = fsdp.clip_grad_norm(max_norm=100.0, norm_type=float("-inf"))[0]
+    ddp_neg_inf = ddp.clip_grad_norm(max_norm=100.0, norm_type=float("-inf"))[0]
+
+    # Verify that FSDP negative inf norm does NOT collapse to 0.0 due to padding zeros!
+    assert fsdp_neg_inf > 0.0
+    assert math.isclose(fsdp_neg_inf, ddp_neg_inf, rel_tol=1e-5)
+
+
+def test_virtual_fsdp_eval_forward_while_training_preserves_state() -> None:
+    """Verify eval_forward disables dropout during execution and restores training mode."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+
+    class DropoutLinear(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.drop = nn.Dropout(p=0.999)
+            self.fc = nn.Linear(8, 4)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.fc(self.drop(x)))
+
+    model = DropoutLinear()
+    fsdp = VirtualFSDP(model, grid=grid)
+    fsdp.train()
+    assert fsdp.is_training is True
+
+    x = torch.ones(2, 8)
+    out1 = fsdp.eval_forward(0, x)
+    out2 = fsdp.eval_forward(0, x)
+    assert torch.allclose(out1, out2)
+
+    assert fsdp.is_training is True
+    assert fsdp._exec_replicas[0].training is True
+    assert fsdp._exec_replicas[0].drop.training is True

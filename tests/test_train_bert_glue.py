@@ -214,8 +214,44 @@ def test_parse_args_invalid_max_grad_norm_and_seed() -> None:
     with pytest.raises(ValueError, match="max-grad-norm must be a non-negative finite float"):
         parse_args(["--max-grad-norm", "-0.1"])
 
+    with pytest.raises(ValueError, match="max-grad-norm must be a non-negative finite float"):
+        parse_args(["--max-grad-norm", "inf"])
+
+    with pytest.raises(ValueError, match="max-grad-norm must be a non-negative finite float"):
+        parse_args(["--max-grad-norm", "nan"])
+
     with pytest.raises(ValueError, match="seed must be between 0 and 4294967295"):
         parse_args(["--seed", "-10"])
 
     with pytest.raises(ValueError, match="seed must be between 0 and 4294967295"):
         parse_args(["--seed", "4294967296"])
+
+
+def test_main_multi_epoch_smoke(capsys: Any) -> None:
+    """Verify main() executes multiple epochs without sampler iterator exhaustion."""
+    main(
+        [
+            "--use-tiny-bert",
+            "--synthetic",
+            "--parallelism",
+            "ddp",
+            "--ranks",
+            "2",
+            "--batch-size",
+            "2",
+            "--dataset-size",
+            "4",
+            "--epochs",
+            "2",
+            "--max-steps",
+            "2",
+            "--device",
+            "cpu",
+            "--seed",
+            "42",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert "--- Epoch 1 completed in" in out
+    assert "--- Epoch 2 completed in" in out
+    assert "Final parameter lockstep check: True" in out

@@ -62,6 +62,7 @@ class AmpGradScalerState:
         self._grads_scaled: bool = False
         self._grads_unscaled: bool = False
         self._overflow_detected: bool = False
+        self._scaled_ranks: set[int] = set()
 
     @property
     def scaler_enabled(self) -> bool:
@@ -86,6 +87,7 @@ class AmpGradScalerState:
         if scaler.is_enabled():
             scaler.scale(loss).backward()  # type: ignore[no-untyped-call]
             self._grads_scaled = True
+            self._scaled_ranks.add(rank)
         else:
             loss.backward()  # type: ignore[no-untyped-call]
 
@@ -104,7 +106,8 @@ class AmpGradScalerState:
             rank_has_non_finite = torch.zeros(1, dtype=torch.bool, device=device)
             for p in params:
                 if p.grad is not None:
-                    rank_has_non_finite = rank_has_non_finite | (~torch.isfinite(p.grad)).any()
+                    if not bool(torch.isfinite(p.grad).all().item()):
+                        rank_has_non_finite.fill_(True)
                     p.grad.detach().mul_(inv_scale)
             if bool(rank_has_non_finite.item()):
                 self._overflow_detected = True
@@ -124,13 +127,13 @@ class AmpGradScalerState:
                 f"optimizers keys {sorted(optimizers.keys())} do not match grid ranks {sorted(self.ranks)}"
             )
 
-        if self._grads_scaled and not self._grads_unscaled:
-            self.unscale_and_check_finite(rank_params)
-
         try:
+            if self._grads_scaled and not self._grads_unscaled:
+                self.unscale_and_check_finite(rank_params)
+
             for rank in self.ranks:
                 scaler = self._scalers[rank]
-                if self._grads_scaled and scaler.is_enabled():
+                if self._grads_scaled and scaler.is_enabled() and rank in self._scaled_ranks:
                     current_scale = float(scaler.get_scale())
                     if self._overflow_detected:
                         self._growth_trackers[rank] = 0
@@ -152,3 +155,4 @@ class AmpGradScalerState:
             self._grads_scaled = False
             self._grads_unscaled = False
             self._overflow_detected = False
+            self._scaled_ranks.clear()

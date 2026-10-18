@@ -48,6 +48,7 @@ class VirtualDDP[ModelT: nn.Module]:
         self.replicas: dict[int, ModelT] = {
             rank: copy.deepcopy(module).to(target_device) for rank in self.grid.ranks
         }
+        self._gradients_synced: bool = False
 
     @property
     def is_training(self) -> bool:
@@ -97,6 +98,7 @@ class VirtualDDP[ModelT: nn.Module]:
         """Execute a backward pass on a virtual rank, scaling loss when FP16 GradScaler is active."""
         if rank not in self.replicas:
             raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
+        self._gradients_synced = False
         self._amp.backward(rank, loss)
 
     def sync_gradients(self) -> None:
@@ -105,10 +107,6 @@ class VirtualDDP[ModelT: nn.Module]:
         Unscales FP16 gradients (detecting overflow prior to sanitization), averages
         gradients computed locally on each rank, and updates each replica's grad tensor.
         """
-        self._amp.unscale_and_check_finite(
-            {rank: self.replicas[rank].parameters() for rank in self.grid.ranks}
-        )
-
         first_replica = self.replicas[self.grid.ranks[0]]
         param_names = [name for name, _ in first_replica.named_parameters()]
         rank_params = {
@@ -126,6 +124,15 @@ class VirtualDDP[ModelT: nn.Module]:
                 raise RuntimeError(
                     f"Gradient presence mismatch for parameter '{name}': missing on ranks {missing}"
                 )
+
+        self._amp.unscale_and_check_finite(
+            {rank: self.replicas[rank].parameters() for rank in self.grid.ranks}
+        )
+
+        for name in param_names:
+            grads_present = [rank_params[r][name].grad is not None for r in self.grid.ranks]
+            if not any(grads_present):
+                continue
 
             # Gather gradients across all virtual ranks, sanitizing non-finite values (NaN/Inf)
             # to prevent ROCm kernel underflow/overflow artifacts from poisoning the reduction
@@ -147,6 +154,8 @@ class VirtualDDP[ModelT: nn.Module]:
                 assert p_rank.grad is not None
                 p_rank.grad.copy_(reduced_grads[rank])
 
+        self._gradients_synced = True
+
     def clip_grad_norm(
         self,
         max_norm: float,
@@ -157,9 +166,8 @@ class VirtualDDP[ModelT: nn.Module]:
         Returns:
             Mapping from rank ID to the pre-clipping total gradient norm on that rank.
         """
-        if max_norm is not None:
-            if math.isnan(max_norm) or max_norm < 0.0:
-                raise ValueError(f"max_norm must be a non-negative finite float, got {max_norm}")
+        if max_norm is None or not math.isfinite(max_norm) or max_norm < 0.0:
+            raise ValueError(f"max_norm must be a non-negative finite float, got {max_norm}")
 
         try:
             norm_type_f = float(norm_type)
@@ -170,6 +178,12 @@ class VirtualDDP[ModelT: nn.Module]:
 
         if not math.isinf(norm_type_f) and norm_type_f <= 0:
             raise ValueError(f"norm_type must be greater than 0, got {norm_type_f}")
+
+        if not self._gradients_synced:
+            raise RuntimeError(
+                "VirtualDDP.clip_grad_norm() cannot be called before sync_gradients(). "
+                "Gradients must be synchronized across virtual ranks before clipping."
+            )
 
         self._amp.unscale_and_check_finite(
             {rank: self.replicas[rank].parameters() for rank in self.grid.ranks}
@@ -211,6 +225,12 @@ class VirtualDDP[ModelT: nn.Module]:
         max_grad_norm: float | None = None,
     ) -> dict[int, float] | None:
         """Execute an optimizer step and zero gradients across all replicas in lockstep."""
+        if not self._gradients_synced:
+            raise RuntimeError(
+                "VirtualDDP.step() cannot be called before sync_gradients(). "
+                "Gradients must be synchronized across virtual ranks before stepping optimizers."
+            )
+
         norms: dict[int, float] | None = None
         if max_grad_norm is not None and max_grad_norm > 0:
             norms = self.clip_grad_norm(max_grad_norm)
@@ -219,6 +239,7 @@ class VirtualDDP[ModelT: nn.Module]:
             {rank: self.replicas[rank].parameters() for rank in self.grid.ranks},
         )
         self.communicator.barrier()
+        self._gradients_synced = False
         return norms
 
     def get_full_parameters(self) -> dict[str, torch.Tensor]:

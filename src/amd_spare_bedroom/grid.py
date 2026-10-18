@@ -11,8 +11,8 @@ import torch
 
 def seed_everything(seed: int) -> int:
     """Deterministically seed Python, NumPy, and PyTorch (CPU and ROCm/CUDA) RNGs."""
-    if not (0 <= seed < 2**32):
-        raise ValueError(f"Seed must be an integer between 0 and {2**32 - 1}, got {seed}")
+    if isinstance(seed, bool) or not isinstance(seed, int) or not (0 <= seed < 2**32):
+        raise ValueError(f"Seed must be an integer between 0 and {2**32 - 1}, got {seed!r}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

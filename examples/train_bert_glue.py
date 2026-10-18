@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import sys
 import time
 from collections.abc import Sized
 from typing import Any, cast
@@ -276,7 +275,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
     parsed = parser.parse_args(args)
     if parsed.max_grad_norm is not None:
-        if math.isnan(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
+        if not math.isfinite(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
             raise ValueError(
                 f"max-grad-norm must be a non-negative finite float, got {parsed.max_grad_norm}"
             )
@@ -485,7 +484,9 @@ def main(argv: list[str] | None = None) -> None:
                                 print(
                                     f"    Desync on Rank {r} for {n}: max diff = {(p0 - pr).abs().max().item()}, p0 nan={torch.isnan(p0).any().item()}, pr nan={torch.isnan(pr).any().item()}"
                                 )
-                sys.exit(1)
+                raise RuntimeError(
+                    f"Parameter desynchronization detected at step {step} across virtual ranks"
+                )
 
             avg_loss = sum(step_losses.values()) / len(step_losses)
             loss_breakdown = ", ".join(
@@ -502,11 +503,7 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"Training finished successfully across all emulated ranks using {args.parallelism.upper()}!"
     )
-    if hasattr(dist_model, "assert_parameters_synced"):
-        print(f"Final parameter lockstep check: {dist_model.assert_parameters_synced()}")
-    else:
-        full_p = dist_model.get_full_parameters()
-        print(f"Final sharded parameter reconstruction check: {len(full_p)} parameters active")
+    print(f"Final parameter lockstep check: {dist_model.assert_parameters_synced()}")
     print("=" * 70)
 
 
