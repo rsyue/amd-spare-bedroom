@@ -132,3 +132,25 @@ def test_resolve_amp_dtype_variants() -> None:
 
     with pytest.raises(ValueError, match="Unsupported AMP dtype"):
         resolve_amp_dtype("int8")
+
+
+def test_seed_everything_bounds_validation() -> None:
+    """Verify seed_everything rejects negative seeds and integers exceeding 32-bit unsigned range."""
+    with pytest.raises(ValueError, match="Seed must be an integer between 0 and 4294967295"):
+        seed_everything(-1)
+
+    with pytest.raises(ValueError, match="Seed must be an integer between 0 and 4294967295"):
+        seed_everything(2**32)
+
+
+def test_virtual_grid_generator_device_alignment() -> None:
+    """Verify that per-rank Generators match the grid's target device type."""
+    grid_cpu = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    assert grid_cpu.get_generator(0).device == torch.device("cpu")
+    assert grid_cpu.get_generator(1).device == torch.device("cpu")
+
+    if torch.cuda.is_available():
+        grid_cuda = VirtualGrid.create(
+            world_size=2, total_memory_gb=4.0, device_type="cuda", seed=42
+        )
+        assert grid_cuda.get_generator(0).device == torch.device("cuda")

@@ -3,6 +3,7 @@
 import copy
 from typing import cast
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -309,3 +310,75 @@ def test_virtual_ddp_amp_bfloat16_and_float16() -> None:
 
     assert ddp_fp16.get_grad_scale(0) == initial_scale * 0.5
     assert torch.allclose(ddp_fp16.get_replica(0).fc.weight.data, weights_before)
+
+
+def test_virtual_ddp_eval_forward_submodule_preservation() -> None:
+    """Verify eval_forward restores intentionally frozen submodule states."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+
+    class CompositeModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = nn.Linear(4, 4)
+            self.head = nn.Linear(4, 2)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return cast(torch.Tensor, self.head(self.backbone(x)))
+
+    model = CompositeModel()
+    ddp: VirtualDDP[CompositeModel] = VirtualDDP(model, grid=grid)
+    ddp.train(True)
+    # Freeze backbone
+    for replica in ddp.replicas.values():
+        replica.backbone.eval()
+
+    assert ddp.get_replica(0).training is True
+    assert ddp.get_replica(0).backbone.training is False
+
+    x = torch.randn(2, 4)
+    out = ddp.eval_forward(0, x)
+    assert out.requires_grad is False
+
+    # Backbone must remain in eval mode, while root model remains in train mode
+    assert ddp.get_replica(0).training is True
+    assert ddp.get_replica(0).backbone.training is False
+
+
+def test_virtual_ddp_enable_grad_scaler_flag_and_full_parameters() -> None:
+    """Verify enable_grad_scaler flag and get_full_parameters method."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleModel()
+    ddp = VirtualDDP(model, grid=grid, amp_dtype="float16", enable_grad_scaler=False)
+    assert ddp._amp.scaler_enabled is False
+
+    full_params = ddp.get_full_parameters()
+    assert "fc.weight" in full_params
+    assert torch.equal(full_params["fc.weight"], ddp.get_replica(0).fc.weight.data)
+
+
+def test_virtual_ddp_clip_grad_norm_validations() -> None:
+    """Verify clip_grad_norm validates max_norm and norm_type bounds."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleModel()
+    ddp = VirtualDDP(model, grid=grid)
+
+    with pytest.raises(ValueError, match="max_norm must be a non-negative finite float"):
+        ddp.clip_grad_norm(max_norm=-0.5)
+
+    with pytest.raises(ValueError, match="norm_type must be greater than 0"):
+        ddp.clip_grad_norm(max_norm=1.0, norm_type=0.0)
+
+
+def test_virtual_ddp_gradient_presence_mismatch_raises() -> None:
+    """Verify sync_gradients raises RuntimeError if gradients exist on some ranks but not all."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleModel()
+    ddp = VirtualDDP(model, grid=grid)
+
+    x = torch.randn(2, 4)
+    out0 = ddp.forward(0, x)
+    out0.sum().backward()
+    # Rank 1 computes NO gradient
+
+    with pytest.raises(RuntimeError, match="Gradient presence mismatch for parameter 'fc.weight'"):
+        ddp.sync_gradients()

@@ -11,6 +11,8 @@ import torch
 
 def seed_everything(seed: int) -> int:
     """Deterministically seed Python, NumPy, and PyTorch (CPU and ROCm/CUDA) RNGs."""
+    if not (0 <= seed < 2**32):
+        raise ValueError(f"Seed must be an integer between 0 and {2**32 - 1}, got {seed}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -57,7 +59,7 @@ class VirtualGrid:
         base_seed = seed if seed is not None else 0
         self._generators: dict[int, torch.Generator] = {}
         for rank in self.ranks:
-            gen = torch.Generator()
+            gen = torch.Generator(device=self.device_type)
             gen.manual_seed(base_seed + rank)
             self._generators[rank] = gen
 

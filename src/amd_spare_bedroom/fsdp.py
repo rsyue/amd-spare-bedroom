@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Self
 import torch
 import torch.nn as nn
 
-from amd_spare_bedroom.amp import AmpGradScalerState
+from amd_spare_bedroom.amp import ROCM_GRAD_FINITE_BOUND, AmpGradScalerState
 from amd_spare_bedroom.communicator import VirtualCommunicator
 
 if TYPE_CHECKING:
@@ -43,6 +43,7 @@ class VirtualFSDP[ModelT: nn.Module]:
         grid: VirtualGrid,
         communicator: VirtualCommunicator | None = None,
         amp_dtype: torch.dtype | str | None = None,
+        enable_grad_scaler: bool | None = None,
     ) -> None:
         self.grid = grid
         self.communicator = communicator if communicator is not None else VirtualCommunicator(grid)
@@ -52,6 +53,7 @@ class VirtualFSDP[ModelT: nn.Module]:
             device_type=self.grid.device_type,
             ranks=self.grid.ranks,
             amp_dtype=amp_dtype,
+            enable_grad_scaler=enable_grad_scaler,
         )
         self.amp_dtype: torch.dtype | None = self._amp.amp_dtype
 
@@ -173,14 +175,14 @@ class VirtualFSDP[ModelT: nn.Module]:
         if rank not in self._exec_replicas:
             raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
         replica = self._exec_replicas[rank]
-        was_training = replica.training
+        prev_states = {m: m.training for m in replica.modules()}
         replica.eval()
         try:
             with torch.no_grad():
                 return self.forward(rank, *args, **kwargs)
         finally:
-            if was_training:
-                replica.train(True)
+            for m, state in prev_states.items():
+                m.train(state)
 
     def backward(self, rank: int, loss: torch.Tensor) -> None:
         """Execute a backward pass on rank, scaling loss when FP16 GradScaler is active."""
@@ -198,19 +200,29 @@ class VirtualFSDP[ModelT: nn.Module]:
             {rank: self._exec_replicas[rank].parameters() for rank in self.grid.ranks}
         )
 
+        rank_params = {
+            rank: dict(self._exec_replicas[rank].named_parameters()) for rank in self.grid.ranks
+        }
+
         for name, meta in self.metadata.items():
-            # Check if gradient exists
-            p0 = dict(self._exec_replicas[self.grid.ranks[0]].named_parameters())[name]
-            if p0.grad is None:
+            grads_present = [rank_params[r][name].grad is not None for r in self.grid.ranks]
+            if not any(grads_present):
                 continue
+            if not all(grads_present):
+                missing = [
+                    r for r, pres in zip(self.grid.ranks, grads_present, strict=True) if not pres
+                ]
+                raise RuntimeError(
+                    f"Gradient presence mismatch for parameter '{name}': missing on ranks {missing}"
+                )
 
             full_grads_by_rank: dict[int, torch.Tensor] = {}
             for rank in self.grid.ranks:
-                p_rank = dict(self._exec_replicas[rank].named_parameters())[name]
-                if p_rank.grad is None:
-                    raise RuntimeError(f"Gradient missing on rank {rank} for parameter '{name}'")
-
-                p_rank.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+                p_rank = rank_params[rank][name]
+                assert p_rank.grad is not None
+                p_rank.grad.nan_to_num_(
+                    nan=0.0, posinf=ROCM_GRAD_FINITE_BOUND, neginf=-ROCM_GRAD_FINITE_BOUND
+                )
                 flat_grad = p_rank.grad.view(-1)
                 if meta.padding_len > 0:
                     pad = torch.zeros(
@@ -233,35 +245,77 @@ class VirtualFSDP[ModelT: nn.Module]:
 
             # Free gradient memory from the un-sharded execution models
             for rank in self.grid.ranks:
-                dict(self._exec_replicas[rank].named_parameters())[name].grad = None
+                rank_params[rank][name].grad = None
 
     def clip_grad_norm(
         self,
         max_norm: float,
-        norm_type: float = 2.0,
+        norm_type: float | str = 2.0,
     ) -> dict[int, float]:
         """Compute exact global gradient norm across all ranks' shards and clip in lockstep.
 
         Returns:
             Mapping from rank ID to the pre-clipping global gradient norm.
         """
+        has_shard_grads = any(
+            p.grad is not None
+            for rank in self.grid.ranks
+            for p in self.get_sharded_parameters(rank)
+        )
+        has_exec_grads = any(
+            p.grad is not None
+            for rank in self.grid.ranks
+            for p in self._exec_replicas[rank].parameters()
+        )
+        if not has_shard_grads and has_exec_grads:
+            raise RuntimeError(
+                "VirtualFSDP.clip_grad_norm() cannot be called before sync_gradients(). "
+                "Sharded parameter gradients have not yet been reduce-scattered."
+            )
+
+        if max_norm is not None:
+            if math.isnan(max_norm) or max_norm < 0.0:
+                raise ValueError(f"max_norm must be a non-negative finite float, got {max_norm}")
+
+        try:
+            norm_type_f = float(norm_type)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"norm_type must be a valid float or float string, got {norm_type!r}"
+            ) from e
+
         self._amp.unscale_and_check_finite(
             {rank: self.get_sharded_parameters(rank) for rank in self.grid.ranks}
         )
         for rank in self.grid.ranks:
             for shard in self.get_sharded_parameters(rank):
                 if shard.grad is not None:
-                    shard.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+                    shard.grad.nan_to_num_(
+                        nan=0.0, posinf=ROCM_GRAD_FINITE_BOUND, neginf=-ROCM_GRAD_FINITE_BOUND
+                    )
 
-        if math.isinf(norm_type):
-            max_abs = 0.0
-            for rank in self.grid.ranks:
-                for shard in self.get_sharded_parameters(rank):
-                    if shard.grad is not None and shard.grad.numel() > 0:
-                        val = float(shard.grad.detach().abs().max().item())
-                        if val > max_abs:
-                            max_abs = val
-            global_norm = max_abs
+        if math.isinf(norm_type_f):
+            if norm_type_f > 0:
+                max_abs = 0.0
+                for rank in self.grid.ranks:
+                    for shard in self.get_sharded_parameters(rank):
+                        if shard.grad is not None and shard.grad.numel() > 0:
+                            val = float(shard.grad.detach().abs().max().item())
+                            if val > max_abs:
+                                max_abs = val
+                global_norm = max_abs
+            else:
+                min_abs = float("inf")
+                for rank in self.grid.ranks:
+                    for shard in self.get_sharded_parameters(rank):
+                        if shard.grad is not None and shard.grad.numel() > 0:
+                            val = float(shard.grad.detach().abs().min().item())
+                            if val < min_abs:
+                                min_abs = val
+                global_norm = 0.0 if math.isinf(min_abs) else min_abs
+            self.communicator.barrier()
+        elif norm_type_f <= 0:
+            raise ValueError(f"norm_type must be greater than 0, got {norm_type_f}")
         else:
             rank_pow_sums: dict[int, torch.Tensor] = {}
             for rank in self.grid.ranks:
@@ -269,13 +323,13 @@ class VirtualFSDP[ModelT: nn.Module]:
                 for shard in self.get_sharded_parameters(rank):
                     if shard.grad is not None:
                         shard_norm = torch.linalg.vector_norm(
-                            shard.grad.detach().float(), ord=norm_type
+                            shard.grad.detach().float(), ord=norm_type_f
                         )
-                        local_sum = local_sum + (shard_norm**norm_type)
+                        local_sum = local_sum + (shard_norm**norm_type_f)
                 rank_pow_sums[rank] = local_sum
 
             reduced_sums = self.communicator.all_reduce(rank_pow_sums, op="sum")
-            global_norm = float((reduced_sums[self.grid.ranks[0]] ** (1.0 / norm_type)).item())
+            global_norm = float((reduced_sums[self.grid.ranks[0]] ** (1.0 / norm_type_f)).item())
 
         if max_norm >= 0.0:
             clip_coef = min(1.0, float(max_norm) / (global_norm + 1e-6))
@@ -313,3 +367,11 @@ class VirtualFSDP[ModelT: nn.Module]:
         )
         self.communicator.barrier()
         return norms
+
+    def assert_parameters_synced(self, atol: float = 1e-6) -> bool:
+        """Assert that all parameter shards are finite and synchronized."""
+        for rank in self.grid.ranks:
+            for shard in self.get_sharded_parameters(rank):
+                if not bool(torch.isfinite(shard.data).all().item()):
+                    return False
+        return True

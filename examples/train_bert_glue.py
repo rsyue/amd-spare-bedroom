@@ -7,6 +7,7 @@ on AMD ROCm (targeting gfx_1151 / Radeon 8060S / Strix Halo).
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from collections.abc import Sized
@@ -22,9 +23,10 @@ from transformers import (
     AutoTokenizer,
 )
 
+from amd_spare_bedroom import seed_everything
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
-from amd_spare_bedroom.grid import VirtualGrid, seed_everything
+from amd_spare_bedroom.grid import VirtualGrid
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
 GLUE_TASK_TO_KEYS: dict[str, tuple[str, ...]] = {
@@ -272,7 +274,15 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         choices=["none", "fp32", "float32", "bf16", "bfloat16", "fp16", "float16"],
         help="Automatic mixed precision mode ('none'/'fp32', 'bf16'/'bfloat16', 'fp16'/'float16'; default: 'none')",
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    if parsed.max_grad_norm is not None:
+        if math.isnan(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
+            raise ValueError(
+                f"max-grad-norm must be a non-negative finite float, got {parsed.max_grad_norm}"
+            )
+    if not (0 <= parsed.seed < 2**32):
+        raise ValueError(f"seed must be between 0 and {2**32 - 1}, got {parsed.seed}")
+    return parsed
 
 
 def get_model(
@@ -452,20 +462,20 @@ def main(argv: list[str] | None = None) -> None:
             # B. Collective Gradient Synchronization (All-Reduce for DDP, Reduce-Scatter for FSDP)
             dist_model.sync_gradients()
 
-            # Clip gradients via library seam to ensure numerical stability across virtual ranks
+            # C. Lockstep Optimizer Step with Gradient Clipping
             grad_norm_val = 0.0
-            if args.max_grad_norm > 0:
-                grad_norms = dist_model.clip_grad_norm(args.max_grad_norm)
+            grad_norms = dist_model.step(
+                optimizers,
+                max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+            )
+            if grad_norms is not None:
                 grad_norm_val = grad_norms[grid.ranks[0]]
 
-            # C. Lockstep Optimizer Step
-            dist_model.step(optimizers)
-
             # D. Verify Multi-Rank Weight Parity
-            if hasattr(dist_model, "assert_parameters_synced"):
-                synced = dist_model.assert_parameters_synced()
-                if not synced:
-                    print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
+            synced = dist_model.assert_parameters_synced()
+            if not synced:
+                print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
+                if hasattr(dist_model, "replicas"):
                     ref_p = list(dist_model.replicas[grid.ranks[0]].named_parameters())
                     for r in grid.ranks[1:]:
                         rep_p = dict(dist_model.replicas[r].named_parameters())
@@ -475,7 +485,7 @@ def main(argv: list[str] | None = None) -> None:
                                 print(
                                     f"    Desync on Rank {r} for {n}: max diff = {(p0 - pr).abs().max().item()}, p0 nan={torch.isnan(p0).any().item()}, pr nan={torch.isnan(pr).any().item()}"
                                 )
-                    sys.exit(1)
+                sys.exit(1)
 
             avg_loss = sum(step_losses.values()) / len(step_losses)
             loss_breakdown = ", ".join(

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import TYPE_CHECKING, Any, Self
 
 import torch
 import torch.nn as nn
 
-from amd_spare_bedroom.amp import AmpGradScalerState
+from amd_spare_bedroom.amp import ROCM_GRAD_FINITE_BOUND, AmpGradScalerState
 from amd_spare_bedroom.communicator import VirtualCommunicator
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ class VirtualDDP[ModelT: nn.Module]:
         grid: VirtualGrid,
         communicator: VirtualCommunicator | None = None,
         amp_dtype: torch.dtype | str | None = None,
+        enable_grad_scaler: bool | None = None,
     ) -> None:
         self.grid = grid
         self.communicator = communicator if communicator is not None else VirtualCommunicator(grid)
@@ -37,6 +39,7 @@ class VirtualDDP[ModelT: nn.Module]:
             device_type=self.grid.device_type,
             ranks=self.grid.ranks,
             amp_dtype=amp_dtype,
+            enable_grad_scaler=enable_grad_scaler,
         )
         self.amp_dtype: torch.dtype | None = self._amp.amp_dtype
 
@@ -81,14 +84,14 @@ class VirtualDDP[ModelT: nn.Module]:
     def eval_forward(self, rank: int, *args: Any, **kwargs: Any) -> Any:
         """Execute an evaluation forward pass on a virtual rank under torch.no_grad()."""
         replica = self.get_replica(rank)
-        was_training = replica.training
+        prev_states = {m: m.training for m in replica.modules()}
         replica.eval()
         try:
             with torch.no_grad():
                 return self.forward(rank, *args, **kwargs)
         finally:
-            if was_training:
-                replica.train(True)
+            for m, state in prev_states.items():
+                m.train(state)
 
     def backward(self, rank: int, loss: torch.Tensor) -> None:
         """Execute a backward pass on a virtual rank, scaling loss when FP16 GradScaler is active."""
@@ -108,21 +111,31 @@ class VirtualDDP[ModelT: nn.Module]:
 
         first_replica = self.replicas[self.grid.ranks[0]]
         param_names = [name for name, _ in first_replica.named_parameters()]
+        rank_params = {
+            rank: dict(self.replicas[rank].named_parameters()) for rank in self.grid.ranks
+        }
 
         for name in param_names:
-            # Check if gradient exists on rank 0
-            p0 = dict(first_replica.named_parameters())[name]
-            if p0.grad is None:
+            grads_present = [rank_params[r][name].grad is not None for r in self.grid.ranks]
+            if not any(grads_present):
                 continue
+            if not all(grads_present):
+                missing = [
+                    r for r, pres in zip(self.grid.ranks, grads_present, strict=True) if not pres
+                ]
+                raise RuntimeError(
+                    f"Gradient presence mismatch for parameter '{name}': missing on ranks {missing}"
+                )
 
             # Gather gradients across all virtual ranks, sanitizing non-finite values (NaN/Inf)
             # to prevent ROCm kernel underflow/overflow artifacts from poisoning the reduction
             rank_grads: dict[int, torch.Tensor] = {}
             for rank in self.grid.ranks:
-                p_rank = dict(self.replicas[rank].named_parameters())[name]
-                if p_rank.grad is None:
-                    raise RuntimeError(f"Gradient missing on rank {rank} for parameter '{name}'")
-                p_rank.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+                p_rank = rank_params[rank][name]
+                assert p_rank.grad is not None
+                p_rank.grad.nan_to_num_(
+                    nan=0.0, posinf=ROCM_GRAD_FINITE_BOUND, neginf=-ROCM_GRAD_FINITE_BOUND
+                )
                 rank_grads[rank] = p_rank.grad
 
             # Execute All-Reduce mean reduction
@@ -130,20 +143,34 @@ class VirtualDDP[ModelT: nn.Module]:
 
             # Copy synchronized gradients back to each rank's parameters
             for rank in self.grid.ranks:
-                p_rank = dict(self.replicas[rank].named_parameters())[name]
+                p_rank = rank_params[rank][name]
                 assert p_rank.grad is not None
                 p_rank.grad.copy_(reduced_grads[rank])
 
     def clip_grad_norm(
         self,
         max_norm: float,
-        norm_type: float = 2.0,
+        norm_type: float | str = 2.0,
     ) -> dict[int, float]:
         """Clip gradient norms across all virtual rank replicas in lockstep.
 
         Returns:
             Mapping from rank ID to the pre-clipping total gradient norm on that rank.
         """
+        if max_norm is not None:
+            if math.isnan(max_norm) or max_norm < 0.0:
+                raise ValueError(f"max_norm must be a non-negative finite float, got {max_norm}")
+
+        try:
+            norm_type_f = float(norm_type)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"norm_type must be a valid float or float string, got {norm_type!r}"
+            ) from e
+
+        if not math.isinf(norm_type_f) and norm_type_f <= 0:
+            raise ValueError(f"norm_type must be greater than 0, got {norm_type_f}")
+
         self._amp.unscale_and_check_finite(
             {rank: self.replicas[rank].parameters() for rank in self.grid.ranks}
         )
@@ -152,16 +179,19 @@ class VirtualDDP[ModelT: nn.Module]:
             replica_params = [p for p in self.replicas[rank].parameters() if p.grad is not None]
             for p in replica_params:
                 assert p.grad is not None
-                p.grad.nan_to_num_(nan=0.0, posinf=1e4, neginf=-1e4)
+                p.grad.nan_to_num_(
+                    nan=0.0, posinf=ROCM_GRAD_FINITE_BOUND, neginf=-ROCM_GRAD_FINITE_BOUND
+                )
             if not replica_params:
                 norms[rank] = 0.0
                 continue
             total_norm = torch.nn.utils.clip_grad_norm_(
                 replica_params,
                 max_norm=max_norm,
-                norm_type=norm_type,
+                norm_type=norm_type_f,
             )
             norms[rank] = float(total_norm.item())
+        self.communicator.barrier()
         return norms
 
     def create_optimizers(
@@ -190,6 +220,11 @@ class VirtualDDP[ModelT: nn.Module]:
         )
         self.communicator.barrier()
         return norms
+
+    def get_full_parameters(self) -> dict[str, torch.Tensor]:
+        """Retrieve the full parameter dictionary (from rank 0 replica)."""
+        first_replica = self.replicas[self.grid.ranks[0]]
+        return {name: p.data.clone() for name, p in first_replica.named_parameters()}
 
     def assert_parameters_synced(self, atol: float = 1e-6) -> bool:
         """Assert that all rank replicas hold identical parameter values."""

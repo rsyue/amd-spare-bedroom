@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sized
 from typing import Any, cast
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -206,3 +207,15 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
     assert "AMP Precision Mode:   BF16" in out
     assert "Grad Norm:" in out
     assert "Training finished successfully" in out
+
+
+def test_parse_args_invalid_max_grad_norm_and_seed() -> None:
+    """Verify parse_args rejects invalid max_grad_norm and out-of-range seed values."""
+    with pytest.raises(ValueError, match="max-grad-norm must be a non-negative finite float"):
+        parse_args(["--max-grad-norm", "-0.1"])
+
+    with pytest.raises(ValueError, match="seed must be between 0 and 4294967295"):
+        parse_args(["--seed", "-10"])
+
+    with pytest.raises(ValueError, match="seed must be between 0 and 4294967295"):
+        parse_args(["--seed", "4294967296"])

@@ -3,6 +3,7 @@
 import copy
 from typing import cast
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -344,3 +345,76 @@ def test_virtual_fsdp_amp_bfloat16_and_float16() -> None:
     weights_after = fsdp_fp16.get_full_parameters()
     for name in weights_before:
         assert torch.allclose(weights_after[name], weights_before[name])
+
+
+def test_virtual_fsdp_clip_grad_norm_before_sync_raises() -> None:
+    """Verify clip_grad_norm before sync_gradients raises RuntimeError to protect unscale state."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleLinear()
+    fsdp = VirtualFSDP(model, grid=grid)
+
+    x0 = torch.randn(2, 8)
+    y0 = torch.zeros(2, 4)
+    fsdp.backward(0, nn.functional.mse_loss(fsdp.forward(0, x0), y0))
+
+    with pytest.raises(
+        RuntimeError,
+        match="VirtualFSDP.clip_grad_norm\\(\\) cannot be called before sync_gradients",
+    ):
+        fsdp.clip_grad_norm(max_norm=1.0)
+
+
+def test_virtual_fsdp_clip_grad_norm_infinite_and_validations() -> None:
+    """Verify infinite norms (+inf, -inf, string 'inf') and validation checks."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleLinear()
+    fsdp = VirtualFSDP(model, grid=grid)
+
+    with pytest.raises(ValueError, match="max_norm must be a non-negative finite float"):
+        fsdp.clip_grad_norm(max_norm=-1.0)
+
+    with pytest.raises(ValueError, match="norm_type must be greater than 0"):
+        fsdp.clip_grad_norm(max_norm=1.0, norm_type=0.0)
+
+    x0 = torch.full((2, 8), 3.0)
+    y0 = torch.zeros((2, 4))
+    x1 = torch.full((2, 8), 5.0)
+    y1 = torch.zeros((2, 4))
+
+    fsdp.backward(0, nn.functional.mse_loss(fsdp.forward(0, x0), y0))
+    fsdp.backward(1, nn.functional.mse_loss(fsdp.forward(1, x1), y1))
+    fsdp.sync_gradients()
+
+    # Test string 'inf' and float('inf')
+    norm_str_inf = fsdp.clip_grad_norm(max_norm=100.0, norm_type="inf")
+    norm_float_inf = fsdp.clip_grad_norm(max_norm=100.0, norm_type=float("inf"))
+    assert abs(norm_str_inf[0] - norm_float_inf[0]) < 1e-6
+    assert norm_str_inf[0] > 0.0
+
+    # Test negative infinity norm
+    norm_neg_inf = fsdp.clip_grad_norm(max_norm=100.0, norm_type=float("-inf"))
+    assert norm_neg_inf[0] <= norm_float_inf[0]
+
+
+def test_virtual_fsdp_enable_grad_scaler_and_assert_parameters_synced() -> None:
+    """Verify enable_grad_scaler flag and assert_parameters_synced symmetry."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleLinear()
+    fsdp = VirtualFSDP(model, grid=grid, amp_dtype="float16", enable_grad_scaler=False)
+    assert fsdp._amp.scaler_enabled is False
+    assert fsdp.assert_parameters_synced() is True
+
+
+def test_virtual_fsdp_gradient_presence_mismatch_raises() -> None:
+    """Verify sync_gradients raises RuntimeError if gradients exist on some ranks but not all."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=4.0, device_type="cpu", seed=42)
+    model = SimpleLinear()
+    fsdp = VirtualFSDP(model, grid=grid)
+
+    x = torch.randn(2, 8)
+    out0 = fsdp.forward(0, x)
+    out0.sum().backward()
+    # Rank 1 computes NO gradient
+
+    with pytest.raises(RuntimeError, match="Gradient presence mismatch for parameter 'fc.weight'"):
+        fsdp.sync_gradients()

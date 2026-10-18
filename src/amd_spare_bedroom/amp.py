@@ -11,6 +11,8 @@ import torch.nn as nn
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 
+ROCM_GRAD_FINITE_BOUND: float = 1e4
+
 
 def resolve_amp_dtype(amp_dtype: torch.dtype | str | None) -> torch.dtype | None:
     """Resolve an AMP precision specifier into a torch.dtype (or None for FP32)."""
@@ -95,14 +97,17 @@ class AmpGradScalerState:
         if not self._grads_scaled or self._grads_unscaled:
             return not self._overflow_detected
 
+        device = torch.device(self.device_type)
         for rank, params in rank_params.items():
             scale = float(self._scalers[rank].get_scale())
             inv_scale = 1.0 / scale if scale > 0 else 1.0
+            rank_has_non_finite = torch.zeros(1, dtype=torch.bool, device=device)
             for p in params:
                 if p.grad is not None:
-                    if not bool(torch.isfinite(p.grad).all().item()):
-                        self._overflow_detected = True
+                    rank_has_non_finite = rank_has_non_finite | (~torch.isfinite(p.grad)).any()
                     p.grad.detach().mul_(inv_scale)
+            if bool(rank_has_non_finite.item()):
+                self._overflow_detected = True
 
         self._grads_unscaled = True
         return not self._overflow_detected
@@ -113,30 +118,37 @@ class AmpGradScalerState:
         rank_params: dict[int, Iterable[nn.Parameter]],
     ) -> None:
         """Step optimizers across ranks (skipping and backing off scale on FP16 overflow)."""
+        expected_ranks = set(self.ranks)
+        if set(optimizers.keys()) != expected_ranks:
+            raise ValueError(
+                f"optimizers keys {sorted(optimizers.keys())} do not match grid ranks {sorted(self.ranks)}"
+            )
+
         if self._grads_scaled and not self._grads_unscaled:
             self.unscale_and_check_finite(rank_params)
 
-        for rank in self.ranks:
-            scaler = self._scalers[rank]
-            if self._grads_scaled and scaler.is_enabled():
-                current_scale = float(scaler.get_scale())
-                if self._overflow_detected:
-                    self._growth_trackers[rank] = 0
-                    new_scale = max(1.0, current_scale * scaler.get_backoff_factor())
-                    scaler.update(new_scale=new_scale)
+        try:
+            for rank in self.ranks:
+                scaler = self._scalers[rank]
+                if self._grads_scaled and scaler.is_enabled():
+                    current_scale = float(scaler.get_scale())
+                    if self._overflow_detected:
+                        self._growth_trackers[rank] = 0
+                        new_scale = max(1.0, current_scale * scaler.get_backoff_factor())
+                        scaler.update(new_scale=new_scale)
+                    else:
+                        optimizers[rank].step()
+                        self._growth_trackers[rank] += 1
+                        if self._growth_trackers[rank] >= scaler.get_growth_interval():
+                            self._growth_trackers[rank] = 0
+                            new_scale = current_scale * scaler.get_growth_factor()
+                        else:
+                            new_scale = current_scale
+                        scaler.update(new_scale=new_scale)
                 else:
                     optimizers[rank].step()
-                    self._growth_trackers[rank] += 1
-                    if self._growth_trackers[rank] >= scaler.get_growth_interval():
-                        self._growth_trackers[rank] = 0
-                        new_scale = current_scale * scaler.get_growth_factor()
-                    else:
-                        new_scale = current_scale
-                    scaler.update(new_scale=new_scale)
-            else:
-                optimizers[rank].step()
-            optimizers[rank].zero_grad()
-
-        self._grads_scaled = False
-        self._grads_unscaled = False
-        self._overflow_detected = False
+                optimizers[rank].zero_grad()
+        finally:
+            self._grads_scaled = False
+            self._grads_unscaled = False
+            self._overflow_detected = False

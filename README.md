@@ -91,6 +91,7 @@ flowchart LR
 4. **`VirtualDDP`**: A drop-in wrapper mirroring `torch.nn.parallel.DistributedDataParallel` that coordinates gradient reduction across virtual ranks.
 5. **`VirtualFSDP`**: Fully Sharded Data Parallel wrapper sharding parameters, gradients, and optimizer states across virtual ranks, executing All-Gather for forward passes and Reduce-Scatter for gradients to reduce memory footprint by ~`1 / world_size`.
 6. **`VirtualRankSampler`**: Distributes non-overlapping, seedable dataset slices to each virtual rank.
+7. **`AmpGradScalerState` & `resolve_amp_dtype`**: Coordinates Automatic Mixed Precision (`bfloat16`/`float16`) execution with autocast and dynamic loss scaling across virtual ranks.
 
 ---
 

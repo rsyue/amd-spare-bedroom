@@ -4,7 +4,11 @@ Emulating multiple AMD GPU devices and distributed ranks (DDP, FSDP)
 within unified high-capacity VRAM on AMD ROCm (gfx_1151 / Strix Halo).
 """
 
-from amd_spare_bedroom.amp import AmpGradScalerState, resolve_amp_dtype
+from amd_spare_bedroom.amp import (
+    ROCM_GRAD_FINITE_BOUND,
+    AmpGradScalerState,
+    resolve_amp_dtype,
+)
 from amd_spare_bedroom.communicator import VirtualCommunicator
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
@@ -20,6 +24,7 @@ __license__ = "CC-BY-NC-ND-4.0"
 
 __all__ = [
     "AmpGradScalerState",
+    "ROCM_GRAD_FINITE_BOUND",
     "VirtualCommunicator",
     "VirtualDDP",
     "VirtualDevice",
