@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 import torch
@@ -70,21 +72,10 @@ class VirtualFSDP[ModelT: nn.Module]:
         for name, param in self._skeleton.named_parameters():
             orig_shape = param.shape
             orig_numel = param.numel()
-            flat_param = param.data.view(-1).clone()
-
             shard_len = math.ceil(orig_numel / self.grid.world_size)
             padded_len = shard_len * self.grid.world_size
             padding_len = padded_len - orig_numel
-
-            if padding_len > 0:
-                pad_tensor = torch.zeros(
-                    padding_len, dtype=flat_param.dtype, device=flat_param.device
-                )
-                padded_flat = torch.cat([flat_param, pad_tensor], dim=0)
-            else:
-                padded_flat = flat_param
-
-            shards = list(torch.chunk(padded_flat, chunks=self.grid.world_size, dim=0))
+            shards = self._shard_parameter_tensor(param.data, padding_len)
 
             self.metadata[name] = ParamMetadata(
                 name=name,
@@ -105,6 +96,20 @@ class VirtualFSDP[ModelT: nn.Module]:
             rank: copy.deepcopy(self._skeleton) for rank in self.grid.ranks
         }
         self._gradients_synced: bool = False
+
+    def _shard_parameter_tensor(
+        self,
+        param_tensor: torch.Tensor,
+        padding_len: int,
+    ) -> list[torch.Tensor]:
+        """Flatten, zero-pad if needed, and split a parameter tensor into world_size shards."""
+        flat_param = param_tensor.view(-1).clone()
+        if padding_len > 0:
+            pad_tensor = torch.zeros(padding_len, dtype=flat_param.dtype, device=flat_param.device)
+            padded_flat = torch.cat([flat_param, pad_tensor], dim=0)
+        else:
+            padded_flat = flat_param
+        return list(torch.chunk(padded_flat, chunks=self.grid.world_size, dim=0))
 
     @property
     def is_training(self) -> bool:
@@ -150,6 +155,58 @@ class VirtualFSDP[ModelT: nn.Module]:
             full_params[name] = unpadded.view(meta.orig_shape).clone()
 
         return full_params
+
+    def unwrap_model(self) -> ModelT:
+        """Reconstruct all un-sharded parameters and buffers into the skeleton model and return a copy."""
+        full_params = self.get_full_parameters()
+        skeleton_params = dict(self._skeleton.named_parameters())
+        for name, tensor in full_params.items():
+            skeleton_params[name].data.copy_(tensor)
+
+        skeleton_buffers = dict(self._skeleton.named_buffers())
+        ref_buffers = dict(self._exec_replicas[self.grid.ranks[0]].named_buffers())
+        for name, buf in ref_buffers.items():
+            if name in skeleton_buffers:
+                skeleton_buffers[name].data.copy_(buf.data)
+        return copy.deepcopy(self._skeleton)
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Reconstruct full un-sharded parameters and return the model state_dict."""
+        return self.unwrap_model().state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Load a full model state_dict and re-shard parameters across all virtual ranks."""
+        self._skeleton.load_state_dict(state_dict)
+        for replica in self._exec_replicas.values():
+            replica.load_state_dict(state_dict)
+
+        for name, param in self._skeleton.named_parameters():
+            meta = self.metadata[name]
+            shards = self._shard_parameter_tensor(param.data, meta.padding_len)
+            for rank in self.grid.ranks:
+                self.rank_shards[rank][name].data.copy_(shards[rank])
+
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        *,
+        safe_serialization: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Reconstruct un-sharded weights and save the model in safetensors format."""
+        raw_model: Any = self.unwrap_model()
+        if hasattr(raw_model, "save_pretrained"):
+            raw_model.save_pretrained(
+                save_directory,
+                safe_serialization=safe_serialization,
+                **kwargs,
+            )
+        else:
+            import safetensors.torch
+
+            target_dir = Path(save_directory)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            safetensors.torch.save_file(raw_model.state_dict(), target_dir / "model.safetensors")
 
     def _gather_into_replica(self, rank: int) -> None:
         """All-Gather sharded parameters and reconstruct full tensors into rank's replica."""

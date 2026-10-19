@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
 import torch
@@ -75,6 +77,41 @@ class VirtualDDP[ModelT: nn.Module]:
         if rank not in self.replicas:
             raise IndexError(f"Rank {rank} not found in grid ranks {self.grid.ranks}")
         return self.replicas[rank]
+
+    def unwrap_model(self) -> ModelT:
+        """Return a copy of the synchronized un-sharded model replica on rank 0."""
+        return copy.deepcopy(self.replicas[self.grid.ranks[0]])
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Return the full model state_dict from rank 0."""
+        return self.unwrap_model().state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Load state_dict into all rank replicas in lockstep."""
+        for replica in self.replicas.values():
+            replica.load_state_dict(state_dict)
+
+    def save_pretrained(
+        self,
+        save_directory: str | Path,
+        *,
+        safe_serialization: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Save the unwrapped model to save_directory in safetensors format."""
+        raw_model: Any = self.unwrap_model()
+        if hasattr(raw_model, "save_pretrained"):
+            raw_model.save_pretrained(
+                save_directory,
+                safe_serialization=safe_serialization,
+                **kwargs,
+            )
+        else:
+            import safetensors.torch
+
+            target_dir = Path(save_directory)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            safetensors.torch.save_file(raw_model.state_dict(), target_dir / "model.safetensors")
 
     def forward(self, rank: int, *args: Any, **kwargs: Any) -> Any:
         """Execute a forward pass on a specific virtual rank's model replica."""

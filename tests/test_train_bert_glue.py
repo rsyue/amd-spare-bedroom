@@ -40,6 +40,9 @@ def test_parse_args_defaults() -> None:
     assert args.seed == 42
     assert args.amp == "none"
     assert args.max_grad_norm == 1.0
+    assert args.weight_decay == 0.01
+    assert args.eval_metric == "f1"
+    assert args.checkpoint_dir is None
 
 
 def test_parse_args_custom_and_aliases() -> None:
@@ -55,6 +58,8 @@ def test_parse_args_custom_and_aliases() -> None:
         "4",
         "--lr",
         "1e-4",
+        "--weight-decay",
+        "0.05",
         "--device",
         "cpu",
         "--dataset-size",
@@ -77,6 +82,10 @@ def test_parse_args_custom_and_aliases() -> None:
         "bf16",
         "--max-grad-norm",
         "0.5",
+        "--eval-metric",
+        "accuracy",
+        "--checkpoint-dir",
+        "/tmp/ckpt_test",
     ]
     args = parse_args(cli_args)
     assert args.ranks == 8
@@ -84,6 +93,7 @@ def test_parse_args_custom_and_aliases() -> None:
     assert args.batch_size == 16
     assert args.epochs == 4
     assert args.lr == 1e-4
+    assert args.weight_decay == 0.05
     assert args.device == "cpu"
     assert args.dataset_size == 200
     assert args.max_steps == 10
@@ -96,13 +106,18 @@ def test_parse_args_custom_and_aliases() -> None:
     assert args.seed == 999
     assert args.amp == "bf16"
     assert args.max_grad_norm == 0.5
+    assert args.eval_metric == "accuracy"
+    assert args.checkpoint_dir == "/tmp/ckpt_test"
 
 
 def test_parse_args_use_synthetic_alias() -> None:
-    """Verify --use-synthetic and --precision aliases are parsed properly."""
-    args = parse_args(["--use-synthetic", "--precision", "fp16"])
+    """Verify --use-synthetic, --precision, and --checkpoint-path aliases are parsed properly."""
+    args = parse_args(
+        ["--use-synthetic", "--precision", "fp16", "--checkpoint-path", "/tmp/ckpt_alias"]
+    )
     assert args.synthetic is True
     assert args.amp == "fp16"
+    assert args.checkpoint_dir == "/tmp/ckpt_alias"
 
     args_none = parse_args(["--amp", "none"])
     assert args_none.amp == "none"
@@ -179,8 +194,9 @@ def test_glue_task_mappings() -> None:
     assert GLUE_TASK_NUM_LABELS["stsb"] == 1
 
 
-def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
-    """Verify main() executes end-to-end with AMP, seeding, clip_grad_norm, and per-epoch eval."""
+def test_main_end_to_end_smoke_with_amp(capsys: Any, tmp_path: Any) -> None:
+    """Verify main() executes end-to-end with AMP, seeding, clip_grad_norm, per-epoch eval, and checkpointing."""
+    ckpt_dir = tmp_path / "bert_best_ckpt"
     main(
         [
             "--synthetic",
@@ -203,6 +219,12 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
             "cpu",
             "--seed",
             "123",
+            "--weight-decay",
+            "0.01",
+            "--eval-metric",
+            "f1",
+            "--checkpoint-dir",
+            str(ckpt_dir),
         ]
     )
     out = capsys.readouterr().out
@@ -214,7 +236,12 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any) -> None:
     assert "| F1:" in out
     assert "| Precision:" in out
     assert "| Recall:" in out
+    assert (ckpt_dir / "model.safetensors").is_file()
+    assert (ckpt_dir / "config.json").is_file()
+    assert (ckpt_dir / "tokenizer.json").is_file()
+    assert (ckpt_dir / "checkpoint_metadata.json").is_file()
     assert "Training finished successfully" in out
+    assert "wins at" in out
 
 
 def test_parse_args_invalid_max_grad_norm_and_seed() -> None:
