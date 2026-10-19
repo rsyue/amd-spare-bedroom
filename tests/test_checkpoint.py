@@ -267,3 +267,52 @@ def test_best_checkpoint_saver_min_metric_direction(tmp_path: Path) -> None:
     cm = ClassificationMetrics(accuracy=0.8, f1=0.8, precision=0.8, recall=0.8, loss=0.35)
     assert loss_saver.save_if_best(hf_model, cm, epoch=1) is True
     assert loss_saver.best_score == pytest.approx(0.35)
+
+
+def test_best_checkpoint_saver_plain_nn_module_fallback(tmp_path: Path) -> None:
+    """Verify BestCheckpointSaver falls back to safetensors.torch.save_file for plain nn.Module."""
+    import safetensors.torch
+
+    ckpt_dir = tmp_path / "plain_ckpt"
+    model = _TinyLinearNet()
+    saver = BestCheckpointSaver(ckpt_dir, metric_name="accuracy")
+
+    saved = saver.save_if_best(
+        model,
+        {"accuracy": 0.85},
+        epoch=1,
+        hyperparameters={"lr": 1e-4, "weight_decay": 0.01},
+    )
+    assert saved is True
+    assert (ckpt_dir / "model.safetensors").is_file()
+    assert (ckpt_dir / "checkpoint_metadata.json").is_file()
+    loaded_tensors = safetensors.torch.load_file(ckpt_dir / "model.safetensors")
+    for key, val in model.state_dict().items():
+        assert torch.allclose(loaded_tensors[key], val)
+
+
+def test_best_checkpoint_saver_mode_validation_and_uninitialized(tmp_path: Path) -> None:
+    """Verify mode validation rejects invalid strings and uninitialized format_winner_summary raises."""
+    with pytest.raises(ValueError, match="mode must be 'auto', 'max', or 'min'"):
+        BestCheckpointSaver(tmp_path / "invalid_mode", mode="minimum")  # type: ignore[arg-type]
+
+    saver = BestCheckpointSaver(tmp_path / "uninit_ckpt")
+    with pytest.raises(RuntimeError, match="No checkpoint has been recorded yet."):
+        saver.format_winner_summary()
+
+
+def test_format_hparam_value_and_nan_in_max_mode(tmp_path: Path) -> None:
+    """Verify scientific notation formatting for 1e-4/1e-5 and NaN rejection in max mode."""
+    from amd_spare_bedroom.checkpoint import _format_hparam_value
+
+    assert _format_hparam_value(1e-5) == "1e-5"
+    assert _format_hparam_value(1e-4) == "1e-4"
+    assert _format_hparam_value(0.01) == "0.01"
+    assert _format_hparam_value(0.0) == "0"
+
+    hf_model = _build_tiny_hf_bert()
+    saver = BestCheckpointSaver(tmp_path / "nan_max_ckpt", metric_name="f1", mode="max")
+    assert saver.save_if_best(hf_model, {"f1": 0.80}, epoch=1) is True
+    assert saver.save_if_best(hf_model, {"f1": float("nan")}, epoch=2) is False
+    assert saver.save_if_best(hf_model, {"f1": float("inf")}, epoch=2) is False
+    assert saver.best_score == pytest.approx(0.80)

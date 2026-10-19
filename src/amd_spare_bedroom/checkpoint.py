@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import shutil
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,8 +46,13 @@ class _BestRecord:
 
 
 def _format_hparam_value(val: Any) -> str:
-    """Format a hyperparameter number concisely (e.g., 1e-05 -> '1e-5', 0.01 -> '0.01')."""
+    """Format a hyperparameter number concisely (e.g., 1e-05 -> '1e-5', 1e-4 -> '1e-4', 0.01 -> '0.01')."""
     if isinstance(val, float):
+        if 0 < abs(val) < 0.001 or abs(val) >= 1e5:
+            text = f"{val:e}".replace("e-0", "e-").replace("e+0", "e+")
+            base, exp = text.split("e")
+            base = base.rstrip("0").rstrip(".")
+            return f"{base}e{exp}"
         text = f"{val:g}"
         return text.replace("e-0", "e-").replace("e+0", "e+")
     return str(val)
@@ -66,7 +72,15 @@ class BestCheckpointSaver:
         mode: MetricMode = "auto",
         tokenizer: Any | None = None,
     ) -> None:
-        self.checkpoint_dir = Path(checkpoint_dir)
+        """Initialize the single best-metric checkpoint manager.
+
+        Args:
+            checkpoint_dir: Target directory path where the best checkpoint is stored.
+            metric_name: Evaluation metric to track (e.g. 'f1', 'accuracy', 'perplexity').
+            mode: Comparison mode: 'auto' (inferred from metric name), 'max', or 'min'.
+            tokenizer: Optional tokenizer instance to serialize alongside model weights.
+        """
+        self.checkpoint_dir = Path(checkpoint_dir).resolve()
         self.metric_name = metric_name.strip().lower()
         if mode == "auto":
             if self.metric_name not in METRIC_DIRECTIONS:
@@ -75,8 +89,10 @@ class BestCheckpointSaver:
                     f"Known metrics: {sorted(METRIC_DIRECTIONS.keys())}"
                 )
             self.mode: MetricDirection = METRIC_DIRECTIONS[self.metric_name]
-        else:
+        elif mode in ("max", "min"):
             self.mode = mode
+        else:
+            raise ValueError(f"mode must be 'auto', 'max', or 'min', got {mode!r}")
 
         self.tokenizer = tokenizer
         self._best: _BestRecord | None = None
@@ -107,12 +123,15 @@ class BestCheckpointSaver:
         return score < self._best.score
 
     def _extract_metric_score(self, metrics_dict: Mapping[str, float]) -> float:
-        if self.metric_name in metrics_dict:
-            return float(metrics_dict[self.metric_name])
-        if self.metric_name == "eval_loss" and "loss" in metrics_dict:
-            return float(metrics_dict["loss"])
-        if self.metric_name == "loss" and "eval_loss" in metrics_dict:
-            return float(metrics_dict["eval_loss"])
+        norm_map = {
+            str(k).strip().lower(): float(v) for k, v in metrics_dict.items() if v is not None
+        }
+        if self.metric_name in norm_map:
+            return float(norm_map[self.metric_name])
+        if self.metric_name == "eval_loss" and "loss" in norm_map:
+            return float(norm_map["loss"])
+        if self.metric_name == "loss" and "eval_loss" in norm_map:
+            return float(norm_map["eval_loss"])
         raise KeyError(
             f"Monitored metric {self.metric_name!r} not found in metrics {list(metrics_dict.keys())}"
         )
@@ -127,11 +146,15 @@ class BestCheckpointSaver:
     ) -> bool:
         """Save HuggingFace safetensors model, tokenizer, and metadata if metric improved."""
         if hasattr(metrics, "to_dict"):
-            metrics_dict = cast(dict[str, float], metrics.to_dict())
+            raw_dict = metrics.to_dict()
         elif isinstance(metrics, Mapping):
-            metrics_dict = {str(k): float(v) for k, v in metrics.items() if v is not None}
+            raw_dict = dict(metrics)
         else:
             raise TypeError(f"Unsupported metrics object: {type(metrics)!r}")
+
+        metrics_dict: dict[str, float] = {
+            str(k).strip().lower(): float(v) for k, v in raw_dict.items() if v is not None
+        }
 
         score = self._extract_metric_score(metrics_dict)
         if not self.is_better(score):
@@ -142,17 +165,29 @@ class BestCheckpointSaver:
         hparams_dict = dict(hyperparameters) if hyperparameters is not None else {}
 
         self.checkpoint_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging_dir = self.checkpoint_dir.parent / f".{self.checkpoint_dir.name}.staging"
+        staging_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f".{self.checkpoint_dir.name}.staging_",
+                dir=self.checkpoint_dir.parent,
+            )
+        )
         backup_dir = self.checkpoint_dir.parent / f".{self.checkpoint_dir.name}.backup"
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
 
         try:
-            staging_dir.mkdir(parents=True, exist_ok=True)
-            raw_model.save_pretrained(staging_dir, safe_serialization=True)
+            if hasattr(raw_model, "save_pretrained"):
+                raw_model.save_pretrained(staging_dir, safe_serialization=True)
+            else:
+                import safetensors.torch
 
-            if active_tokenizer is not None and hasattr(active_tokenizer, "save_pretrained"):
-                active_tokenizer.save_pretrained(staging_dir)
+                safetensors.torch.save_file(
+                    raw_model.state_dict(), staging_dir / "model.safetensors"
+                )
+
+            if active_tokenizer is not None:
+                if hasattr(active_tokenizer, "save_pretrained"):
+                    active_tokenizer.save_pretrained(staging_dir)
+                elif hasattr(active_tokenizer, "save"):
+                    active_tokenizer.save(str(staging_dir / "tokenizer.json"))
 
             metadata = {
                 "metric_name": self.metric_name,
@@ -162,7 +197,7 @@ class BestCheckpointSaver:
                 "hyperparameters": hparams_dict,
             }
             (staging_dir / "checkpoint_metadata.json").write_text(
-                json.dumps(metadata, indent=2) + "\n",
+                json.dumps(metadata, indent=2, default=str) + "\n",
                 encoding="utf-8",
             )
 
@@ -173,7 +208,7 @@ class BestCheckpointSaver:
             staging_dir.replace(self.checkpoint_dir)
             if backup_dir.exists():
                 shutil.rmtree(backup_dir)
-        except Exception:
+        except BaseException:
             if staging_dir.exists():
                 shutil.rmtree(staging_dir)
             if not self.checkpoint_dir.exists() and backup_dir.exists():

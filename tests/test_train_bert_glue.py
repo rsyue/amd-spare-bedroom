@@ -241,6 +241,7 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any, tmp_path: Any) -> None:
     assert (ckpt_dir / "tokenizer.json").is_file()
     assert (ckpt_dir / "checkpoint_metadata.json").is_file()
     assert "Training finished successfully" in out
+    assert "wins at" in out
 
 
 def test_parse_args_invalid_max_grad_norm_and_seed() -> None:

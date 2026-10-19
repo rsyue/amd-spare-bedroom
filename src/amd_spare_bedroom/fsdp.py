@@ -157,7 +157,7 @@ class VirtualFSDP[ModelT: nn.Module]:
         return full_params
 
     def unwrap_model(self) -> ModelT:
-        """Reconstruct all un-sharded parameters and buffers into the skeleton model and return it."""
+        """Reconstruct all un-sharded parameters and buffers into the skeleton model and return a copy."""
         full_params = self.get_full_parameters()
         skeleton_params = dict(self._skeleton.named_parameters())
         for name, tensor in full_params.items():
@@ -168,11 +168,11 @@ class VirtualFSDP[ModelT: nn.Module]:
         for name, buf in ref_buffers.items():
             if name in skeleton_buffers:
                 skeleton_buffers[name].data.copy_(buf.data)
-        return self._skeleton
+        return copy.deepcopy(self._skeleton)
 
-    def state_dict(self) -> dict[str, Any]:
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Reconstruct full un-sharded parameters and return the model state_dict."""
-        return self.unwrap_model().state_dict()
+        return self.unwrap_model().state_dict(*args, **kwargs)
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Load a full model state_dict and re-shard parameters across all virtual ranks."""
@@ -193,13 +193,20 @@ class VirtualFSDP[ModelT: nn.Module]:
         safe_serialization: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Reconstruct un-sharded weights and save the HuggingFace model in safetensors format."""
+        """Reconstruct un-sharded weights and save the model in safetensors format."""
         raw_model: Any = self.unwrap_model()
-        raw_model.save_pretrained(
-            save_directory,
-            safe_serialization=safe_serialization,
-            **kwargs,
-        )
+        if hasattr(raw_model, "save_pretrained"):
+            raw_model.save_pretrained(
+                save_directory,
+                safe_serialization=safe_serialization,
+                **kwargs,
+            )
+        else:
+            import safetensors.torch
+
+            target_dir = Path(save_directory)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            safetensors.torch.save_file(raw_model.state_dict(), target_dir / "model.safetensors")
 
     def _gather_into_replica(self, rank: int) -> None:
         """All-Gather sharded parameters and reconstruct full tensors into rank's replica."""

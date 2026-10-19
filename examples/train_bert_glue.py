@@ -23,6 +23,7 @@ from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
 
@@ -316,7 +317,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
 def get_tokenizer(
     model_name: str = "bert-base-uncased",
     synthetic: bool = False,
-) -> Any:
+) -> PreTrainedTokenizerBase:
     """Instantiate a BERT tokenizer (or a self-contained offline tokenizer when synthetic=True)."""
     if synthetic:
         vocab = {
@@ -611,6 +612,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Final parameter lockstep check: {dist_model.assert_parameters_synced()}")
     print("=" * 70)
+    if checkpoint_saver is not None and checkpoint_saver.best_score is not None:
+        print(checkpoint_saver.format_winner_summary())
 
 
 if __name__ == "__main__":

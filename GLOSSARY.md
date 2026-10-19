@@ -53,4 +53,7 @@ flowchart TD
     FSDP --> EVAL
     RS -. "unstride_and_unpad" .-> EVAL
     EVAL --> METRICS["ClassificationMetrics\n(scikit-learn)"]
+    METRICS --> CKPT["BestCheckpointSaver\n(Safetensors & Metadata)"]
+    DDP -. "unwrap_model" .-> CKPT
+    FSDP -. "unwrap_model" .-> CKPT
 ```
