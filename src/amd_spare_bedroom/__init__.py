@@ -19,6 +19,8 @@ from amd_spare_bedroom.grid import (
     seed_everything,
 )
 from amd_spare_bedroom.grid_search import (
+    DEFAULT_LR_GRID_STR,
+    DEFAULT_WEIGHT_DECAY_GRID_STR,
     GridSearchResult,
     HyperparameterGrid,
     TrialConfig,
@@ -29,7 +31,11 @@ from amd_spare_bedroom.grid_search import (
 )
 from amd_spare_bedroom.metrics import (
     ClassificationMetrics,
+    SFTMetrics,
     compute_classification_metrics,
+    compute_sft_metrics,
+    evaluate_causal_lm_epoch,
+    evaluate_causal_lm_model,
     evaluate_classification_epoch,
 )
 from amd_spare_bedroom.sampler import VirtualRankSampler
@@ -41,9 +47,12 @@ __all__ = [
     "AmpGradScalerState",
     "BestCheckpointSaver",
     "ClassificationMetrics",
+    "DEFAULT_LR_GRID_STR",
+    "DEFAULT_WEIGHT_DECAY_GRID_STR",
     "GridSearchResult",
     "HyperparameterGrid",
     "ROCM_GRAD_FINITE_BOUND",
+    "SFTMetrics",
     "TrialConfig",
     "TrialResult",
     "VirtualCommunicator",
@@ -55,6 +64,9 @@ __all__ = [
     "VirtualRankSampler",
     "WaveSchedule",
     "compute_classification_metrics",
+    "compute_sft_metrics",
+    "evaluate_causal_lm_epoch",
+    "evaluate_causal_lm_model",
     "evaluate_classification_epoch",
     "parse_float_grid",
     "resolve_amp_dtype",
