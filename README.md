@@ -95,6 +95,7 @@ flowchart LR
 8. **`ClassificationMetrics` & `evaluate_classification_epoch`**: Evaluates distributed `VirtualDDP` and `VirtualFSDP` models across ranks without sampler padding distortion, computing `accuracy`, `f1`, `precision`, and `recall` via `scikit-learn`.
 9. **`BestCheckpointSaver`**: Persists a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and metadata directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification).
 10. **`HyperparameterGrid` & `WaveSchedule`**: Expands Cartesian hyperparameter candidate search spaces into deterministic `TrialConfig` instances and partitions them into sequential waves of concurrent virtual ranks.
+11. **`VirtualGridSearch`**, **`TrialResult`** & **`GridSearchResult`**: Multi-rank hyperparameter trial execution engine running isolated rank replicas, deterministic wave scheduling, and global leaderboard aggregation.
 
 ---
 
@@ -209,6 +210,7 @@ In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vert
 - **Seam 7: Distributed Lockstep Evaluation (`evaluate_classification_epoch`)**: Multi-rank lockstep validation under `eval_forward()`, rank unpadding via `VirtualRankSampler.unstride_and_unpad`, and training state restoration.
 - **Seam 8: Single Best-Metric Checkpoint Saving (`BestCheckpointSaver`)**: Monitored metric tracking, HuggingFace `safetensors` + tokenizer persistence, atomic directory overwrite, and winning trial formatting.
 - **Seam 9: Hyperparameter Search Space Expansion & Wave Scheduler (`HyperparameterGrid`, `WaveSchedule`, `TrialConfig`)**: Deterministic Cartesian trial expansion, sequential wave partitioning across virtual ranks, and idle rank tracking for partial waves.
+- **Seam 10: Multi-Rank Hyperparameter Grid Search Execution Engine (`VirtualGridSearch`, `TrialResult`, `GridSearchResult`)**: Per-rank replica and optimizer isolation, lockstep wave execution with step limits, evaluation aggregation, and single-best safetensors checkpointing.
 
 ---
 
