@@ -353,3 +353,26 @@ def test_evaluate_classification_epoch_exceptions() -> None:
     all_masked = _DictClassificationDataset(torch.randn(2, 4), torch.tensor([-100, -100]))
     with pytest.raises(ValueError, match="All evaluation labels are masked"):
         evaluate_classification_epoch(ddp, all_masked)
+
+
+def test_score_causal_lm_batch_validation() -> None:
+    """Verify _score_causal_lm_batch rejects invalid tensor ranks, shapes, and NaNs."""
+    from amd_spare_bedroom.metrics import _score_causal_lm_batch
+
+    # 1. Non-3D logits
+    with pytest.raises(ValueError, match="Expected 3D logits"):
+        _score_causal_lm_batch(torch.zeros(4, 10), torch.zeros(4, 10, dtype=torch.long))
+
+    # 2. Non-2D labels
+    with pytest.raises(ValueError, match=r"Expected 3D logits .* and 2D labels"):
+        _score_causal_lm_batch(torch.zeros(4, 10, 50), torch.zeros(4, 10, 1, dtype=torch.long))
+
+    # 3. Shape mismatch
+    with pytest.raises(ValueError, match="does not match labels shape"):
+        _score_causal_lm_batch(torch.zeros(4, 10, 50), torch.zeros(4, 12, dtype=torch.long))
+
+    # 4. Non-finite logits
+    nan_logits = torch.zeros(2, 5, 20)
+    nan_logits[0, 0, 0] = float("nan")
+    with pytest.raises(ValueError, match="Evaluation logits contain non-finite"):
+        _score_causal_lm_batch(nan_logits, torch.zeros(2, 5, dtype=torch.long))

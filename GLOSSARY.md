@@ -32,7 +32,7 @@ A deterministic, seedable dataset partitioner that produces non-overlapping batc
 Structured evaluation scores for sequence classification (`ClassificationMetrics`: `accuracy`, `f1`, `precision`, `recall`, `loss` via `compute_classification_metrics` and `evaluate_classification_epoch`) and causal language model Supervised Fine-Tuning (`SFTMetrics`: `eval_loss`, `perplexity`, and masked `token_accuracy` via `compute_sft_metrics` and `evaluate_causal_lm_epoch`), reconstructing sequential dataset order via `VirtualRankSampler.unstride_and_unpad`.
 
 ### Best-Metric Checkpoint Saver
-A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).
+A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification, `perplexity` for causal LM SFT) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).
 
 ### Virtual Grid Search
 A parallel hyperparameter exploration mode (`VirtualGridSearch`, `HyperparameterGrid`, `WaveSchedule`, `TrialConfig`, `TrialResult`, `GridSearchResult`) in which each Virtual Rank in a `VirtualGrid` executes an independent hyperparameter trial without cross-rank gradient averaging, scheduling $N$ total trials in sequential waves of up to `world_size` concurrent trials, persisting a single best loadable checkpoint, and announcing the winning combination on the final stdout line (`GridSearchResult.format_winner_announcement`).
@@ -49,10 +49,10 @@ flowchart TD
     VD --> FSDP["VirtualFSDP\n(Sharded ~1/N Memory)"]
     VC -. "Synchronizes Gradients" .-> DDP
     VC -. "Shards & Gathers" .-> FSDP
-    DDP --> EVAL["evaluate_classification_epoch\n(Distributed Validation)"]
+    DDP --> EVAL["evaluate_classification_epoch /\nevaluate_causal_lm_epoch\n(Distributed Validation)"]
     FSDP --> EVAL
     RS -. "unstride_and_unpad" .-> EVAL
-    EVAL --> METRICS["ClassificationMetrics\n(scikit-learn)"]
+    EVAL --> METRICS["ClassificationMetrics /\nSFTMetrics\n(scikit-learn)"]
     METRICS --> CKPT["BestCheckpointSaver\n(Safetensors & Metadata)"]
     DDP -. "unwrap_model" .-> CKPT
     FSDP -. "unwrap_model" .-> CKPT

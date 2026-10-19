@@ -32,13 +32,14 @@ from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid
-from amd_spare_bedroom.grid_search import VirtualGridSearch, parse_float_grid
+from amd_spare_bedroom.grid_search import (
+    DEFAULT_LR_GRID_STR,
+    DEFAULT_WEIGHT_DECAY_GRID_STR,
+    VirtualGridSearch,
+    parse_float_grid,
+)
 from amd_spare_bedroom.metrics import evaluate_classification_epoch
 from amd_spare_bedroom.sampler import VirtualRankSampler
-
-DEFAULT_LR_GRID_STR = "1e-5,2e-5,3e-5,5e-5,1e-4"
-DEFAULT_WEIGHT_DECAY_GRID_STR = "0.0,0.001,0.01,0.05,0.1"
-
 
 GLUE_TASK_TO_KEYS: dict[str, tuple[str, ...]] = {
     "cola": ("sentence",),

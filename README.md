@@ -181,6 +181,8 @@ A complete Causal Language Model Supervised Fine-Tuning script is provided in [`
 - `--device`: Target device type (`cuda`, `cpu`, or auto-detected; default: auto-detect).
 - `--model-name`: HuggingFace model identifier (default: `bert-base-uncased` for BERT, `meta-llama/Llama-3.2-1B` for SFT).
 - `--use-tiny-bert` / `--use-tiny-llama`: Use compact 2-layer model for fast verification and CI.
+- `--task-name` / `--task`: GLUE task for sequence classification (`mrpc`, `sst2`, `cola`, `qqp`, `mnli`, `qnli`, `rte`, `wnli`, `stsb`; default: `mrpc`).
+- `--dataset-name`: HuggingFace instruction dataset name for SFT (default: `yahma/alpaca-cleaned`).
 - `--dataset-size`: Sample cap (default: full dataset, or 64 if `--synthetic`).
 - `--max-seq-length` / `--seq-len`: Maximum sequence length (default: 128 for BERT, 256 for SFT).
 - `--max-steps`: Maximum training steps per epoch (`<= 0` for full epoch; default: 5).

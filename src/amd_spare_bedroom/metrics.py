@@ -54,9 +54,15 @@ class SFTMetrics:
     perplexity: float
     token_accuracy: float
 
+    @property
+    def loss(self) -> float:
+        """Alias for eval_loss for interface parity with ClassificationMetrics."""
+        return self.eval_loss
+
     def to_dict(self) -> dict[str, float]:
         """Convert SFT metrics into a plain dictionary of float scores."""
         return {
+            "loss": self.eval_loss,
             "eval_loss": self.eval_loss,
             "perplexity": self.perplexity,
             "token_accuracy": self.token_accuracy,
@@ -271,7 +277,14 @@ def compute_sft_metrics(
         token_accuracy = 0.0
 
     loss_val = float(eval_loss)
-    perplexity = math.exp(min(loss_val, 20.0)) if not math.isnan(loss_val) else float("nan")
+    if math.isnan(loss_val):
+        perplexity = float("nan")
+    elif math.isinf(loss_val):
+        perplexity = float("inf") if loss_val > 0 else float("nan")
+    elif loss_val < 0.0:
+        perplexity = 1.0 if loss_val >= -1e-6 else float("nan")
+    else:
+        perplexity = math.exp(min(loss_val, 20.0))
     return SFTMetrics(
         eval_loss=loss_val,
         perplexity=perplexity,
@@ -349,6 +362,18 @@ def _score_causal_lm_batch(
     ignore_index: int = -100,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute shifted predictions, shifted labels, per-sample loss sums, and valid token counts."""
+    if logits_cpu.ndim != 3 or labels_cpu.ndim != 2:
+        raise ValueError(
+            f"Expected 3D logits (batch_size, seq_len, vocab_size) and 2D labels (batch_size, seq_len), "
+            f"got logits.shape={tuple(logits_cpu.shape)}, labels.shape={tuple(labels_cpu.shape)}."
+        )
+    if logits_cpu.shape[0] != labels_cpu.shape[0] or logits_cpu.shape[1] != labels_cpu.shape[1]:
+        raise ValueError(
+            f"Logits shape {tuple(logits_cpu.shape[:2])} does not match labels shape {tuple(labels_cpu.shape)}."
+        )
+    if not torch.isfinite(logits_cpu).all():
+        raise ValueError("Evaluation logits contain non-finite (NaN or Inf) values.")
+
     shift_logits = logits_cpu[..., :-1, :].contiguous().float()
     shift_labels = labels_cpu[..., 1:].contiguous().long()
     shift_preds = torch.argmax(shift_logits, dim=-1).to(dtype=torch.int64)
@@ -459,6 +484,11 @@ def evaluate_causal_lm_model(
     ignore_index: int = -100,
 ) -> SFTMetrics:
     """Evaluate a single Causal LM `nn.Module` on `eval_dataset` and return `SFTMetrics`."""
+    if not isinstance(eval_dataset, Sized):
+        raise TypeError(f"eval_dataset must implement __len__, got {type(eval_dataset).__name__}")
+    if len(eval_dataset) <= 0:
+        raise ValueError(f"eval_dataset must be non-empty, got length {len(eval_dataset)}.")
+
     resolved_device = torch.device(device) if isinstance(device, str) else device
     resolved_amp = resolve_amp_dtype(amp_dtype)
     scaler = AmpGradScalerState(
@@ -483,8 +513,11 @@ def evaluate_causal_lm_model(
                     for k, v in batch.items()
                 }
                 labels_tensor = device_batch.get("labels", device_batch.get("label"))
+                forward_inputs = {
+                    k: v for k, v in device_batch.items() if k not in ("labels", "label")
+                }
                 with scaler.autocast_context():
-                    outputs = model(**device_batch)
+                    outputs = model(**forward_inputs)
                 logits_cpu, labels_cpu = _extract_logits_and_labels_from_outputs(
                     outputs, labels_tensor
                 )
@@ -496,7 +529,11 @@ def evaluate_causal_lm_model(
                 total_loss_sum += float(sample_loss_sums.sum().item())
                 total_valid_tokens += int(sample_valid_counts.sum().item())
 
-        eval_loss = total_loss_sum / total_valid_tokens if total_valid_tokens > 0 else 0.0
+        if total_valid_tokens <= 0:
+            raise ValueError(
+                "All evaluation tokens are masked with ignore_index (-100); zero valid tokens to evaluate."
+            )
+        eval_loss = total_loss_sum / total_valid_tokens
         return compute_sft_metrics(
             eval_loss=eval_loss,
             shift_preds=torch.cat(all_preds, dim=0),
@@ -534,40 +571,41 @@ def evaluate_causal_lm_epoch(
         rank_loss_sums: dict[int, list[torch.Tensor]] = {r: [] for r in grid.ranks}
         rank_token_counts: dict[int, list[torch.Tensor]] = {r: [] for r in grid.ranks}
 
-        for step_batches in zip(*(dataloaders[r] for r in grid.ranks), strict=True):
-            for rank, batch in zip(grid.ranks, step_batches, strict=True):
-                logits_cpu, labels_cpu = _extract_batch_logits_and_labels(
-                    dist_model, rank, batch, device
+        with torch.no_grad():
+            for step_batches in zip(*(dataloaders[r] for r in grid.ranks), strict=True):
+                for rank, batch in zip(grid.ranks, step_batches, strict=True):
+                    logits_cpu, labels_cpu = _extract_batch_logits_and_labels(
+                        dist_model, rank, batch, device
+                    )
+                    shift_preds, shift_labels, sample_loss_sums, sample_valid_counts = (
+                        _score_causal_lm_batch(logits_cpu, labels_cpu, ignore_index=ignore_index)
+                    )
+                    rank_shift_preds[rank].append(shift_preds)
+                    rank_shift_labels[rank].append(shift_labels)
+                    rank_loss_sums[rank].append(sample_loss_sums)
+                    rank_token_counts[rank].append(sample_valid_counts)
+
+            cat_preds = [torch.cat(rank_shift_preds[r], dim=0) for r in grid.ranks]
+            cat_labels = [torch.cat(rank_shift_labels[r], dim=0) for r in grid.ranks]
+            cat_losses = [torch.cat(rank_loss_sums[r], dim=0) for r in grid.ranks]
+            cat_counts = [torch.cat(rank_token_counts[r], dim=0) for r in grid.ranks]
+
+            valid_preds = VirtualRankSampler.unstride_and_unpad(cat_preds, dataset_size)
+            valid_labels = VirtualRankSampler.unstride_and_unpad(cat_labels, dataset_size)
+            valid_loss_sums = VirtualRankSampler.unstride_and_unpad(cat_losses, dataset_size)
+            valid_counts = VirtualRankSampler.unstride_and_unpad(cat_counts, dataset_size)
+
+            total_valid_tokens = int(valid_counts.sum().item())
+            if total_valid_tokens <= 0:
+                raise ValueError(
+                    "All evaluation tokens are masked with ignore_index (-100); zero valid tokens to evaluate."
                 )
-                shift_preds, shift_labels, sample_loss_sums, sample_valid_counts = (
-                    _score_causal_lm_batch(logits_cpu, labels_cpu, ignore_index=ignore_index)
-                )
-                rank_shift_preds[rank].append(shift_preds)
-                rank_shift_labels[rank].append(shift_labels)
-                rank_loss_sums[rank].append(sample_loss_sums)
-                rank_token_counts[rank].append(sample_valid_counts)
-
-        cat_preds = [torch.cat(rank_shift_preds[r], dim=0) for r in grid.ranks]
-        cat_labels = [torch.cat(rank_shift_labels[r], dim=0) for r in grid.ranks]
-        cat_losses = [torch.cat(rank_loss_sums[r], dim=0) for r in grid.ranks]
-        cat_counts = [torch.cat(rank_token_counts[r], dim=0) for r in grid.ranks]
-
-        valid_preds = VirtualRankSampler.unstride_and_unpad(cat_preds, dataset_size)
-        valid_labels = VirtualRankSampler.unstride_and_unpad(cat_labels, dataset_size)
-        valid_loss_sums = VirtualRankSampler.unstride_and_unpad(cat_losses, dataset_size)
-        valid_counts = VirtualRankSampler.unstride_and_unpad(cat_counts, dataset_size)
-
-        total_valid_tokens = int(valid_counts.sum().item())
-        eval_loss = (
-            float(valid_loss_sums.sum().item() / total_valid_tokens)
-            if total_valid_tokens > 0
-            else 0.0
-        )
-        return compute_sft_metrics(
-            eval_loss=eval_loss,
-            shift_preds=valid_preds,
-            shift_labels=valid_labels,
-            ignore_index=ignore_index,
-        )
+            eval_loss = float(valid_loss_sums.sum().item() / total_valid_tokens)
+            return compute_sft_metrics(
+                eval_loss=eval_loss,
+                shift_preds=valid_preds,
+                shift_labels=valid_labels,
+                ignore_index=ignore_index,
+            )
     finally:
         dist_model.train(was_training)

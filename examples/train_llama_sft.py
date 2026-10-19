@@ -7,7 +7,8 @@ Demonstrates emulating multi-rank VirtualFSDP and VirtualDDP on AMD ROCm
 from __future__ import annotations
 
 import argparse
-import sys
+import gc
+import math
 import time
 from collections.abc import Sized
 from typing import Any, cast
@@ -30,13 +31,14 @@ from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
-from amd_spare_bedroom.grid_search import VirtualGridSearch, parse_float_grid
-from amd_spare_bedroom.metrics import evaluate_causal_lm_epoch, evaluate_causal_lm_model
-from amd_spare_bedroom.sampler import VirtualRankSampler
-from examples.train_bert_glue import (
+from amd_spare_bedroom.grid_search import (
     DEFAULT_LR_GRID_STR,
     DEFAULT_WEIGHT_DECAY_GRID_STR,
+    VirtualGridSearch,
+    parse_float_grid,
 )
+from amd_spare_bedroom.metrics import evaluate_causal_lm_epoch, evaluate_causal_lm_model
+from amd_spare_bedroom.sampler import VirtualRankSampler
 
 
 class SyntheticSFTDataset(Dataset[dict[str, torch.Tensor]]):
@@ -48,6 +50,8 @@ class SyntheticSFTDataset(Dataset[dict[str, torch.Tensor]]):
         seq_len: int = 64,
         vocab_size: int = 32000,
     ) -> None:
+        if seq_len < 4:
+            raise ValueError(f"seq_len must be >= 4, got {seq_len}")
         self.num_samples = num_samples
         self.seq_len = seq_len
         self.input_ids = torch.zeros((num_samples, seq_len), dtype=torch.long)
@@ -207,6 +211,8 @@ def get_sft_dataset(
 
             prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
             response_ids = tokenizer.encode(f"{out}{tokenizer.eos_token}", add_special_tokens=False)
+            if len(prompt_ids) >= max_seq_length:
+                prompt_ids = prompt_ids[: max_seq_length - 1]
             full_ids = (prompt_ids + response_ids)[:max_seq_length]
 
             prompt_len = min(len(prompt_ids), len(full_ids))
@@ -385,7 +391,51 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_WEIGHT_DECAY_GRID_STR,
         help=f"Comma- or space-separated weight decay values for grid search (default: '{DEFAULT_WEIGHT_DECAY_GRID_STR}')",
     )
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    if parsed.ranks < 1:
+        raise ValueError(f"ranks must be >= 1, got {parsed.ranks}")
+    if not math.isfinite(parsed.total_vram_gb) or parsed.total_vram_gb <= 0:
+        raise ValueError(
+            f"total-vram-gb must be a positive finite float, got {parsed.total_vram_gb}"
+        )
+    if parsed.batch_size < 1:
+        raise ValueError(f"batch-size must be >= 1, got {parsed.batch_size}")
+    if parsed.epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {parsed.epochs}")
+    if not math.isfinite(parsed.lr) or parsed.lr <= 0:
+        raise ValueError(f"lr must be a positive finite float, got {parsed.lr}")
+    if not math.isfinite(parsed.weight_decay) or parsed.weight_decay < 0:
+        raise ValueError(
+            f"weight-decay must be a non-negative finite float, got {parsed.weight_decay}"
+        )
+    if parsed.max_grad_norm is not None:
+        if not math.isfinite(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
+            raise ValueError(
+                f"max-grad-norm must be a non-negative finite float, got {parsed.max_grad_norm}"
+            )
+    if parsed.max_seq_length < 1:
+        raise ValueError(f"max-seq-length must be >= 1, got {parsed.max_seq_length}")
+    if parsed.dataset_size is not None and parsed.dataset_size < 1:
+        raise ValueError(f"dataset-size must be >= 1 if provided, got {parsed.dataset_size}")
+    if not (0 <= parsed.seed < 2**32):
+        raise ValueError(f"seed must be between 0 and {2**32 - 1}, got {parsed.seed}")
+    if parsed.checkpoint_dir is not None and not str(parsed.checkpoint_dir).strip():
+        raise ValueError("checkpoint-dir cannot be an empty path string if provided.")
+
+    if parsed.grid_search:
+        parse_float_grid(
+            parsed.lr_grid,
+            name="--lr-grid",
+            min_val=0.0,
+            allow_zero=False,
+        )
+        parse_float_grid(
+            parsed.weight_decay_grid,
+            name="--weight-decay-grid",
+            min_val=0.0,
+            allow_zero=True,
+        )
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -518,6 +568,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         dist_model = VirtualDDP(base_model, grid=grid, amp_dtype=args.amp)
 
+    del base_model
+    gc.collect()
+
     dist_model.train()
     optimizers = dist_model.create_optimizers(
         torch.optim.AdamW, lr=args.lr, weight_decay=args.weight_decay
@@ -583,21 +636,20 @@ def main(argv: list[str] | None = None) -> None:
             # B. Collective Gradient Synchronization
             dist_model.sync_gradients()
 
-            # Clip gradients via library seam
+            # C. Lockstep Optimizer Step with Gradient Clipping via library seam
             grad_norm_val = 0.0
-            if args.max_grad_norm > 0:
-                grad_norms = dist_model.clip_grad_norm(args.max_grad_norm)
+            grad_norms = dist_model.step(
+                optimizers,
+                max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
+            )
+            if grad_norms is not None:
                 grad_norm_val = grad_norms[grid.ranks[0]]
-
-            # C. Lockstep Optimizer Step
-            dist_model.step(optimizers)
 
             # D. Verify Multi-Rank Weight Parity
             if hasattr(dist_model, "assert_parameters_synced"):
                 synced = dist_model.assert_parameters_synced()
                 if not synced:
-                    print(f"[!] Warning: Parameter desynchronization detected at step {step}!")
-                    sys.exit(1)
+                    raise RuntimeError(f"Parameter desynchronization detected at step {step}!")
 
             avg_loss = sum(step_losses.values()) / len(step_losses)
             loss_breakdown = ", ".join(
@@ -606,6 +658,13 @@ def main(argv: list[str] | None = None) -> None:
             print(
                 f"  Step {step:02d} | Avg Loss: {avg_loss:.4f} | Grad Norm: {grad_norm_val:.4f} | Ranks: [{loss_breakdown}] | Mode: {args.parallelism.upper()}"
             )
+
+        del rank_iters
+        if "batches" in locals():
+            del batches
+        gc.collect()
+        if target_device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         epoch_time = time.perf_counter() - epoch_start
         print(f"--- Epoch {epoch + 1} completed in {epoch_time:.2f}s ---")

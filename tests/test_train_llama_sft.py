@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import re
+import subprocess
+import sys
 from collections.abc import Sized
 from typing import Any, cast
 
@@ -18,9 +20,9 @@ from amd_spare_bedroom import (
     VirtualGrid,
     compute_sft_metrics,
     evaluate_causal_lm_epoch,
+    evaluate_causal_lm_model,
     seed_everything,
 )
-from amd_spare_bedroom.metrics import evaluate_causal_lm_model
 from examples.train_llama_sft import (
     SyntheticSFTDataset,
     get_llama_model,
@@ -32,7 +34,7 @@ from examples.train_llama_sft import (
 
 
 def test_compute_sft_metrics_known_values_and_masking() -> None:
-    """Seam 1: Verify compute_sft_metrics with known loss and masked label handling."""
+    """Seam 12: Verify compute_sft_metrics with known loss and masked label handling."""
     # Loss = ln(4) -> perplexity == 4.0
     known_loss = math.log(4.0)
     # 6 positions: 4 unmasked, 2 masked with -100
@@ -98,7 +100,7 @@ def test_compute_sft_metrics_known_values_and_masking() -> None:
 
 
 def test_evaluate_causal_lm_epoch_ddp_fsdp_parity_and_unpadding() -> None:
-    """Seam 2: Verify 2-rank DDP and FSDP evaluation match single-device evaluation on 7 samples."""
+    """Seam 12: Verify 2-rank DDP and FSDP evaluation match single-device evaluation on 7 samples."""
     seed_everything(42)
     dataset = SyntheticSFTDataset(num_samples=7, seq_len=16, vocab_size=100)
 
@@ -261,7 +263,7 @@ def test_get_tokenizer_synthetic() -> None:
 
 
 def test_main_end_to_end_fsdp_smoke_and_checkpoint(capsys: Any, tmp_path: Any) -> None:
-    """Seam 3: Verify train_llama_sft.py main() executes in FSDP mode with AMP and saves checkpoint."""
+    """Seam 12: Verify train_llama_sft.py main() executes in FSDP mode with AMP and saves checkpoint."""
     ckpt_dir = tmp_path / "llama_sft_ckpt"
     main(
         [
@@ -316,7 +318,7 @@ def test_main_end_to_end_fsdp_smoke_and_checkpoint(capsys: Any, tmp_path: Any) -
 
 
 def test_main_end_to_end_ddp_smoke(capsys: Any) -> None:
-    """Seam 3: Verify train_llama_sft.py main() executes in DDP mode."""
+    """Seam 12: Verify train_llama_sft.py main() executes in DDP mode."""
     main(
         [
             "--synthetic",
@@ -351,7 +353,7 @@ def test_main_end_to_end_ddp_smoke(capsys: Any) -> None:
 
 
 def test_main_grid_search_causal_lm(capsys: Any, tmp_path: Any) -> None:
-    """Seam 3: Verify train_llama_sft.py --grid-search executes and announces winner on final line."""
+    """Seam 12: Verify train_llama_sft.py --grid-search executes and announces winner on final line."""
     ckpt_dir = tmp_path / "llama_grid_ckpt"
     main(
         [
@@ -422,3 +424,129 @@ def test_get_sft_dataset_fallback_splits(monkeypatch: Any) -> None:
     # 20 samples -> val_size = max(int(20 * 0.1), 1) = 2, train_size = 18
     assert len(cast(Sized, train_ds)) == 18
     assert len(cast(Sized, val_ds)) == 2
+
+
+def test_parse_args_validation() -> None:
+    """Verify parse_args enforces strict parameter bounds and grid validations."""
+    with pytest.raises(ValueError, match="lr must be a positive finite float"):
+        parse_args(["--lr", "-0.01"])
+    with pytest.raises(ValueError, match="lr must be a positive finite float"):
+        parse_args(["--lr", "0.0"])
+    with pytest.raises(ValueError, match="lr must be a positive finite float"):
+        parse_args(["--lr", "nan"])
+    with pytest.raises(ValueError, match="weight-decay must be a non-negative finite float"):
+        parse_args(["--weight-decay", "-1.0"])
+    with pytest.raises(ValueError, match="max-grad-norm must be a non-negative finite float"):
+        parse_args(["--max-grad-norm", "-0.5"])
+    with pytest.raises(ValueError, match="seed must be between 0 and"):
+        parse_args(["--seed", "-1"])
+    with pytest.raises(ValueError, match="seed must be between 0 and"):
+        parse_args(["--seed", str(2**32)])
+    with pytest.raises(ValueError, match="ranks must be >= 1"):
+        parse_args(["--ranks", "0"])
+    with pytest.raises(ValueError, match="batch-size must be >= 1"):
+        parse_args(["--batch-size", "0"])
+    with pytest.raises(ValueError, match="epochs must be >= 1"):
+        parse_args(["--epochs", "0"])
+    with pytest.raises(ValueError, match="max-seq-length must be >= 1"):
+        parse_args(["--max-seq-length", "0"])
+    with pytest.raises(ValueError, match="dataset-size must be >= 1"):
+        parse_args(["--dataset-size", "0"])
+    with pytest.raises(ValueError, match="total-vram-gb must be a positive finite float"):
+        parse_args(["--total-vram-gb", "-10"])
+    with pytest.raises(ValueError, match="checkpoint-dir cannot be an empty path string"):
+        parse_args(["--checkpoint-dir", "   "])
+    with pytest.raises(ValueError, match="--lr-grid"):
+        parse_args(["--grid-search", "--lr-grid", "1e-5,0.0"])
+
+
+def test_compute_sft_metrics_edge_cases() -> None:
+    """Verify compute_sft_metrics properly handles infinite, NaN, and negative losses."""
+    # Positive infinite loss produces infinite perplexity (not clamped to 4.85e8)
+    inf_metrics = compute_sft_metrics(
+        eval_loss=float("inf"),
+        shift_preds=torch.tensor([1, 2]),
+        shift_labels=torch.tensor([1, 2]),
+    )
+    assert math.isinf(inf_metrics.perplexity)
+    assert inf_metrics.perplexity > 0
+    assert inf_metrics.loss == float("inf")
+    assert inf_metrics.to_dict()["loss"] == float("inf")
+
+    # Negative infinite loss produces NaN perplexity
+    neg_inf_metrics = compute_sft_metrics(
+        eval_loss=float("-inf"),
+        shift_preds=torch.tensor([1, 2]),
+        shift_labels=torch.tensor([1, 2]),
+    )
+    assert math.isnan(neg_inf_metrics.perplexity)
+
+    # NaN loss produces NaN perplexity
+    nan_metrics = compute_sft_metrics(
+        eval_loss=float("nan"),
+        shift_preds=torch.tensor([1, 2]),
+        shift_labels=torch.tensor([1, 2]),
+    )
+    assert math.isnan(nan_metrics.perplexity)
+
+    # Negative loss below epsilon produces NaN
+    neg_metrics = compute_sft_metrics(
+        eval_loss=-0.5,
+        shift_preds=torch.tensor([1, 2]),
+        shift_labels=torch.tensor([1, 2]),
+    )
+    assert math.isnan(neg_metrics.perplexity)
+
+    # Small negative epsilon noise rounds to 1.0
+    eps_metrics = compute_sft_metrics(
+        eval_loss=-1e-7,
+        shift_preds=torch.tensor([1, 2]),
+        shift_labels=torch.tensor([1, 2]),
+    )
+    assert eps_metrics.perplexity == pytest.approx(1.0)
+
+
+def test_evaluate_causal_lm_zero_valid_tokens_and_empty_dataset() -> None:
+    """Verify evaluate_causal_lm_model and evaluate_causal_lm_epoch reject zero unmasked tokens."""
+    base_model = get_llama_model(model_name="tiny-llama", use_tiny=True)
+
+    # 1. Empty dataset rejection
+    class _EmptyDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
+        def __len__(self) -> int:
+            return 0
+
+        def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+            raise IndexError
+
+    with pytest.raises(ValueError, match="eval_dataset must be non-empty"):
+        evaluate_causal_lm_model(base_model, _EmptyDataset())
+
+    # 2. All labels masked with -100
+    class _AllMaskedDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+            return {
+                "input_ids": torch.tensor([1, 5, 6, 2], dtype=torch.long),
+                "labels": torch.tensor([-100, -100, -100, -100], dtype=torch.long),
+            }
+
+    with pytest.raises(ValueError, match="All evaluation tokens are masked"):
+        evaluate_causal_lm_model(base_model, _AllMaskedDataset())
+
+    grid = VirtualGrid(world_size=2, total_memory_bytes=8 * 1024**3, device_type="cpu")
+    ddp = VirtualDDP(base_model, grid=grid)
+    with pytest.raises(ValueError, match="All evaluation tokens are masked"):
+        evaluate_causal_lm_epoch(ddp, _AllMaskedDataset(), batch_size=2)
+
+
+def test_cli_standalone_execution() -> None:
+    """Verify examples/train_llama_sft.py can be invoked directly as a standalone CLI script."""
+    result = subprocess.run(
+        [sys.executable, "examples/train_llama_sft.py", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "Supervised Fine-Tuning (SFT) on Llama 3.2 1B" in result.stdout

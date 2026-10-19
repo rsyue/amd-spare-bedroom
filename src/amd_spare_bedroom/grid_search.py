@@ -32,6 +32,9 @@ from amd_spare_bedroom.checkpoint import METRIC_DIRECTIONS, BestCheckpointSaver
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
 from amd_spare_bedroom.metrics import AverageMode, compute_classification_metrics
 
+DEFAULT_LR_GRID_STR = "1e-5,2e-5,3e-5,5e-5,1e-4"
+DEFAULT_WEIGHT_DECAY_GRID_STR = "0.0,0.001,0.01,0.05,0.1"
+
 
 def parse_float_grid(
     raw: str,
