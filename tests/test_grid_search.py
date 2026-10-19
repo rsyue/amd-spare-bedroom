@@ -106,3 +106,77 @@ def test_hyperparameter_grid_validation_errors() -> None:
 
     with pytest.raises(ValueError, match="world_size must be >= 1"):
         grid.plan_waves(-2)
+
+
+def test_trial_config_and_wave_schedule_immutability() -> None:
+    """Verify TrialConfig.params and WaveSchedule.rank_to_trial are read-only mapping proxies."""
+    grid = HyperparameterGrid({"lr": [1e-4]})
+    trial = grid.trials[0]
+
+    with pytest.raises(TypeError):
+        trial.params["lr"] = 1.0  # type: ignore[index]
+
+    wave = grid.plan_waves(world_size=2)[0]
+    with pytest.raises(TypeError):
+        wave.rank_to_trial[0] = trial  # type: ignore[index]
+
+
+def test_hyperparameter_grid_heterogeneous_and_generator_candidates() -> None:
+    """Verify support for heterogeneous parameter types and generator candidate iterables."""
+    grid = HyperparameterGrid(
+        {
+            "model_type": ["bert", "roberta"],
+            "use_bias": [True, False],
+            "hidden_dims": [(64, 64)],
+            "lr": (val for val in [1e-5, 2e-5]),  # type: ignore[dict-item]
+        }
+    )
+    assert grid.total_trials == 8
+    first = grid.trials[0]
+    assert first.params["model_type"] == "bert"
+    assert first.params["use_bias"] is True
+    assert first.params["hidden_dims"] == (64, 64)
+    assert first.params["lr"] == 1e-5
+
+
+def test_hyperparameter_grid_extended_validation() -> None:
+    """Verify defensive type and boundary checks for param_grid, keys, and world_size."""
+    with pytest.raises(TypeError, match="param_grid must be a Mapping"):
+        HyperparameterGrid([("lr", [1e-5])])  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="Hyperparameter key must be a str"):
+        HyperparameterGrid({100: [1e-5]})  # type: ignore[dict-item]
+
+    with pytest.raises(ValueError, match="must not be empty or whitespace"):
+        HyperparameterGrid({"   ": [1e-5]})
+
+    with pytest.raises(TypeError, match="must be a non-string Sequence"):
+        HyperparameterGrid({"model": "bert"})
+
+    grid = HyperparameterGrid({"lr": [1e-5, 2e-5]})
+    with pytest.raises(TypeError, match="world_size must be an int or VirtualGrid"):
+        grid.plan_waves(True)
+
+    with pytest.raises(TypeError, match="world_size must be an int or VirtualGrid"):
+        grid.plan_waves(2.5)  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="world_size must be an int or VirtualGrid"):
+        grid.plan_waves("4")  # type: ignore[arg-type]
+
+
+def test_plan_waves_single_rank_and_single_trial() -> None:
+    """Verify plan_waves behavior when world_size=1 or total_trials=1."""
+    single_trial_grid = HyperparameterGrid({"lr": [1e-4]})
+    waves_4ranks = single_trial_grid.plan_waves(world_size=4)
+    assert len(waves_4ranks) == 1
+    assert waves_4ranks[0].active_ranks == (0,)
+    assert waves_4ranks[0].idle_ranks == (1, 2, 3)
+
+    three_trials_grid = HyperparameterGrid({"lr": [1e-4, 2e-4, 3e-4]})
+    waves_1rank = three_trials_grid.plan_waves(world_size=1)
+    assert len(waves_1rank) == 3
+    for idx, wave in enumerate(waves_1rank):
+        assert wave.wave_index == idx
+        assert wave.active_ranks == (0,)
+        assert wave.idle_ranks == ()
+        assert wave.rank_to_trial[0].trial_id == idx

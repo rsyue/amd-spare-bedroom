@@ -59,4 +59,8 @@ flowchart TD
     METRICS --> CKPT["BestCheckpointSaver\n(Safetensors & Metadata)"]
     DDP -. "unwrap_model" .-> CKPT
     FSDP -. "unwrap_model" .-> CKPT
+    VG --> HG["HyperparameterGrid\n(Cartesian Search Space)"]
+    HG --> TC["TrialConfig\n(trial_id & params)"]
+    HG --> WS["WaveSchedule\n(plan_waves)"]
+    WS -. "assigns trials per wave" .-> VR
 ```
