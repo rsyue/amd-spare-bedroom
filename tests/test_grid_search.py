@@ -561,3 +561,59 @@ def test_grid_search_result_format_winner_announcement() -> None:
     assert (
         result.format_winner_announcement() == "LR of 1e-5 and weight decay of 0.01 wins at 0.91 F1"
     )
+
+
+def test_format_winner_custom_hparams_and_non_finite() -> None:
+    """Verify format_winner handles custom parameter dicts and non-finite floats gracefully."""
+    import math
+
+    # Custom parameters
+    formatted = BestCheckpointSaver.format_winner(
+        hyperparameters={"dropout": 0.2, "warmup_ratio": 0.1},
+        metric_name="accuracy",
+        best_score=0.884,
+    )
+    assert formatted == "dropout of 0.2 and warmup_ratio of 0.1 wins at 0.88 Accuracy"
+
+    # Single custom parameter
+    formatted_single = BestCheckpointSaver.format_winner(
+        hyperparameters={"dropout": 0.1},
+        metric_name="loss",
+        best_score=0.25,
+    )
+    assert formatted_single == "dropout of 0.1 wins at 0.25 Loss"
+
+    # Empty hyperparameters
+    formatted_empty = BestCheckpointSaver.format_winner(
+        hyperparameters={},
+        metric_name="f1",
+        best_score=0.95,
+    )
+    assert formatted_empty == "default hyperparameters wins at 0.95 F1"
+
+    # Non-finite values
+    formatted_inf = BestCheckpointSaver.format_winner(
+        hyperparameters={"lr": math.inf, "weight_decay": 0.01},
+        metric_name="f1",
+        best_score=0.50,
+    )
+    assert formatted_inf == "LR of inf and weight decay of 0.01 wins at 0.50 F1"
+
+
+def test_best_checkpoint_saver_path_safety(tmp_path: Path) -> None:
+    """Verify BestCheckpointSaver rejects empty string, cwd, root, and home directory paths."""
+    with pytest.raises(ValueError, match="checkpoint_dir must be a non-empty directory path"):
+        BestCheckpointSaver(checkpoint_dir="   ")
+
+    with pytest.raises(ValueError, match="cannot be the current working directory"):
+        BestCheckpointSaver(checkpoint_dir=".")
+
+    with pytest.raises(ValueError, match="cannot be the current working directory"):
+        BestCheckpointSaver(checkpoint_dir=Path.cwd())
+
+    with pytest.raises(ValueError, match="cannot be the filesystem root or home directory"):
+        BestCheckpointSaver(checkpoint_dir="/")
+
+    # Valid sub-directory succeeds
+    valid_saver = BestCheckpointSaver(checkpoint_dir=tmp_path / "valid_ckpt")
+    assert valid_saver.checkpoint_dir == (tmp_path / "valid_ckpt").resolve()

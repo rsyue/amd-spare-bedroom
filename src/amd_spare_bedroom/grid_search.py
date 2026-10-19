@@ -33,6 +33,70 @@ from amd_spare_bedroom.grid import VirtualGrid, seed_everything
 from amd_spare_bedroom.metrics import AverageMode, compute_classification_metrics
 
 
+def parse_float_grid(
+    raw: str,
+    *,
+    name: str = "grid",
+    min_val: float | None = None,
+    allow_zero: bool = True,
+    allow_negative: bool = False,
+    deduplicate: bool = True,
+) -> list[float]:
+    """Parse a comma- or whitespace-separated string into a validated list of floats.
+
+    Args:
+        raw: Comma- and/or whitespace-delimited string of float values.
+        name: Name of the parameter or CLI flag for error messaging.
+        min_val: Optional minimum value threshold.
+        allow_zero: Whether zero is allowed when min_val is 0.0.
+        allow_negative: Whether negative values are allowed.
+        deduplicate: Whether to remove duplicate values while preserving order.
+
+    Returns:
+        List of parsed and validated floating point numbers.
+
+    Raises:
+        TypeError: If raw is not a string.
+        ValueError: If empty, non-numeric tokens exist, non-finite values (NaN/Inf) exist,
+            or values violate bounds.
+    """
+    if not isinstance(raw, str):
+        raise TypeError(f"{name} must be a string, got {type(raw).__name__}.")
+    tokens = [tok for part in raw.split(",") for tok in part.split() if tok.strip()]
+    if not tokens:
+        raise ValueError(f"{name} must contain at least one numeric value.")
+
+    values: list[float] = []
+    seen: set[float] = set()
+    for tok in tokens:
+        try:
+            val = float(tok)
+        except ValueError:
+            raise ValueError(f"Invalid numeric value {tok!r} in {name}.") from None
+
+        if not math.isfinite(val):
+            raise ValueError(f"{name} values must be finite numbers, got {tok!r}.")
+
+        if not allow_negative and val < 0.0:
+            raise ValueError(f"{name} values must be non-negative, got {val}.")
+
+        if min_val is not None:
+            if not allow_zero and val <= min_val:
+                raise ValueError(
+                    f"Values in {name} must be strictly greater than {min_val}, got {val}."
+                )
+            if allow_zero and val < min_val:
+                raise ValueError(f"Values in {name} must be >= {min_val}, got {val}.")
+
+        if deduplicate:
+            if val in seen:
+                continue
+            seen.add(val)
+        values.append(val)
+
+    return values
+
+
 @dataclass(frozen=True)
 class TrialConfig:
     """A single hyperparameter trial configuration in a grid search.
@@ -693,9 +757,6 @@ class VirtualGridSearch:
                     s.optimizer.state.clear()
                     s.replica.to("cpu")
                 states.clear()
-                del state
-                del rank_iters
-                del batches
                 gc.collect()
                 if torch.device(self.grid.device_type).type == "cuda" and torch.cuda.is_available():
                     torch.cuda.empty_cache()

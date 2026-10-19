@@ -25,6 +25,7 @@ from amd_spare_bedroom.grid_search import (
     TrialResult,
     VirtualGridSearch,
     WaveSchedule,
+    parse_float_grid,
 )
 from amd_spare_bedroom.metrics import (
     ClassificationMetrics,
@@ -55,6 +56,7 @@ __all__ = [
     "WaveSchedule",
     "compute_classification_metrics",
     "evaluate_classification_epoch",
+    "parse_float_grid",
     "resolve_amp_dtype",
     "seed_everything",
 ]

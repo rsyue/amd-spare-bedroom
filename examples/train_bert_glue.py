@@ -32,21 +32,12 @@ from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid
-from amd_spare_bedroom.grid_search import VirtualGridSearch
+from amd_spare_bedroom.grid_search import VirtualGridSearch, parse_float_grid
 from amd_spare_bedroom.metrics import evaluate_classification_epoch
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
 DEFAULT_LR_GRID_STR = "1e-5,2e-5,3e-5,5e-5,1e-4"
 DEFAULT_WEIGHT_DECAY_GRID_STR = "0.0,0.001,0.01,0.05,0.1"
-
-
-def parse_float_grid(raw: str, *, name: str = "grid") -> list[float]:
-    """Parse a comma- or whitespace-separated string into a list of floats."""
-    tokens = [tok for part in raw.split(",") for tok in part.split() if tok.strip()]
-    values = [float(tok) for tok in tokens]
-    if not values:
-        raise ValueError(f"{name} must contain at least one numeric value.")
-    return values
 
 
 GLUE_TASK_TO_KEYS: dict[str, tuple[str, ...]] = {
@@ -335,6 +326,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help=f"Comma- or space-separated weight decay values for grid search (default: '{DEFAULT_WEIGHT_DECAY_GRID_STR}')",
     )
     parsed = parser.parse_args(args)
+    if not math.isfinite(parsed.lr) or parsed.lr <= 0:
+        raise ValueError(f"lr must be a positive finite float, got {parsed.lr}")
+    if not math.isfinite(parsed.weight_decay) or parsed.weight_decay < 0:
+        raise ValueError(
+            f"weight-decay must be a non-negative finite float, got {parsed.weight_decay}"
+        )
     if parsed.max_grad_norm is not None:
         if not math.isfinite(parsed.max_grad_norm) or parsed.max_grad_norm < 0:
             raise ValueError(
@@ -342,6 +339,25 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             )
     if not (0 <= parsed.seed < 2**32):
         raise ValueError(f"seed must be between 0 and {2**32 - 1}, got {parsed.seed}")
+
+    if parsed.grid_search:
+        if GLUE_TASK_NUM_LABELS.get(parsed.task_name, 2) <= 1:
+            raise ValueError(
+                f"--grid-search does not support regression task '{parsed.task_name}' "
+                f"because classification metrics are required to evaluate trials."
+            )
+        parse_float_grid(
+            parsed.lr_grid,
+            name="--lr-grid",
+            min_val=0.0,
+            allow_zero=False,
+        )
+        parse_float_grid(
+            parsed.weight_decay_grid,
+            name="--weight-decay-grid",
+            min_val=0.0,
+            allow_zero=True,
+        )
     return parsed
 
 
@@ -410,8 +426,13 @@ def main(argv: list[str] | None = None) -> None:
 
     seed_everything(args.seed)
 
+    mode_title = (
+        "Hyperparameter Grid Search"
+        if args.grid_search
+        else f"Virtual {args.parallelism.upper()} Training"
+    )
     print("=" * 70)
-    print(f"AMD SPARE BEDROOM: Virtual {args.parallelism.upper()} Training on ROCm (gfx_1151)")
+    print(f"AMD SPARE BEDROOM: {mode_title} on ROCm (gfx_1151)")
     print("=" * 70)
 
     # 1. Initialize Virtual Grid
@@ -465,7 +486,6 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     dataset_sized = cast(Sized, dataset)
-    target_device = torch.device(grid.device_type)
     dataset_type = "Synthetic" if args.synthetic else f"GLUE ({args.task_name.upper()})"
     print(f"[*] Dataset:              {dataset_type} ({len(dataset_sized)} samples)")
     has_max_steps = args.max_steps is not None and args.max_steps > 0
@@ -514,8 +534,12 @@ def main(argv: list[str] | None = None) -> None:
         print(
             f"[*] Grid search completed {len(result.trials)} trials in {result.num_waves} wave(s)."
         )
+        if checkpoint_saver is not None:
+            print(f"[*] Best model checkpoint saved to '{checkpoint_saver.checkpoint_dir}'")
         print(result.format_winner_announcement())
         return
+
+    target_device = torch.device(grid.device_type)
 
     if args.parallelism == "fsdp":
         print(
@@ -664,7 +688,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 if saved:
                     print(
-                        f"[*] Saved new best checkpoint to '{args.checkpoint_dir}' "
+                        f"[*] Saved new best checkpoint to '{checkpoint_saver.checkpoint_dir}' "
                         f"({args.eval_metric}={checkpoint_saver.best_score:.4f})"
                     )
         else:

@@ -251,6 +251,7 @@ def test_main_end_to_end_smoke_with_amp(capsys: Any, tmp_path: Any) -> None:
     assert (ckpt_dir / "config.json").is_file()
     assert (ckpt_dir / "tokenizer.json").is_file()
     assert (ckpt_dir / "checkpoint_metadata.json").is_file()
+    assert "Training finished successfully" in out
     assert "wins at" in out
 
 
@@ -270,6 +271,18 @@ def test_parse_args_invalid_max_grad_norm_and_seed() -> None:
 
     with pytest.raises(ValueError, match="seed must be between 0 and 4294967295"):
         parse_args(["--seed", "4294967296"])
+
+    with pytest.raises(ValueError, match="lr must be a positive finite float"):
+        parse_args(["--lr=-1e-4"])
+
+    with pytest.raises(ValueError, match="lr must be a positive finite float"):
+        parse_args(["--lr", "0"])
+
+    with pytest.raises(ValueError, match="weight-decay must be a non-negative finite float"):
+        parse_args(["--weight-decay=-0.01"])
+
+    with pytest.raises(ValueError, match="weight-decay must be a non-negative finite float"):
+        parse_args(["--weight-decay", "nan"])
 
 
 def test_main_multi_epoch_smoke(capsys: Any) -> None:
@@ -330,18 +343,71 @@ def test_main_regression_task_eval_skip(capsys: Any) -> None:
     assert "Eval skipped: Task 'stsb' is a regression benchmark" in out
 
 
+def test_parse_float_grid_comprehensive() -> None:
+    """Verify parse_float_grid defensive parsing, bounds, finiteness, and deduplication."""
+    from amd_spare_bedroom.grid_search import parse_float_grid
+
+    assert parse_float_grid("1e-5, 2e-5, 3e-5") == [1e-5, 2e-5, 3e-5]
+    assert parse_float_grid("0.0 0.01 0.1") == [0.0, 0.01, 0.1]
+    assert parse_float_grid(" 1e-4 ,\t 2e-4 \n , 3e-4 ") == [1e-4, 2e-4, 3e-4]
+
+    # Deduplication
+    assert parse_float_grid("1e-5, 1e-5, 2e-5, 1e-5") == [1e-5, 2e-5]
+
+    # Non-string input
+    with pytest.raises(TypeError, match="--lr-grid must be a string"):
+        parse_float_grid(123, name="--lr-grid")  # type: ignore[arg-type]
+
+    # Empty string or whitespace/commas only
+    with pytest.raises(ValueError, match="--lr-grid must contain at least one numeric value"):
+        parse_float_grid(" ,  , ", name="--lr-grid")
+
+    # Non-numeric token with contextual name
+    with pytest.raises(ValueError, match=r"Invalid numeric value 'foo' in --lr-grid"):
+        parse_float_grid("1e-5, foo", name="--lr-grid")
+
+    # Non-finite values
+    with pytest.raises(ValueError, match=r"--lr-grid values must be finite numbers, got 'nan'"):
+        parse_float_grid("nan, 1e-5", name="--lr-grid")
+    with pytest.raises(ValueError, match=r"--lr-grid values must be finite numbers, got 'inf'"):
+        parse_float_grid("inf, 1e-5", name="--lr-grid")
+    with pytest.raises(ValueError, match=r"--lr-grid values must be finite numbers, got '-inf'"):
+        parse_float_grid("-inf, 1e-5", name="--lr-grid")
+
+    # Negative values
+    with pytest.raises(ValueError, match=r"--lr-grid values must be non-negative, got -1e-05"):
+        parse_float_grid("-1e-5, 1e-5", name="--lr-grid")
+
+    # Strictly positive (allow_zero=False)
+    with pytest.raises(ValueError, match=r"Values in --lr-grid must be strictly greater than 0.0"):
+        parse_float_grid("0.0, 1e-5", name="--lr-grid", min_val=0.0, allow_zero=False)
+
+
+def test_main_grid_search_regression_task_rejected() -> None:
+    """Verify --grid-search immediately rejects regression tasks like STS-B."""
+    with pytest.raises(
+        ValueError,
+        match=r"--grid-search does not support regression task 'stsb'",
+    ):
+        main(
+            [
+                "--grid-search",
+                "--task-name",
+                "stsb",
+                "--synthetic",
+                "--use-tiny-bert",
+                "--ranks",
+                "2",
+            ]
+        )
+
+
 def test_main_grid_search_end_to_end_and_checkpoint_persistence(capsys: Any, tmp_path: Any) -> None:
     """Seam 2 (#8): End-to-end --grid-search saves single safetensors checkpoint and announces winner last."""
+    import json
     import re
 
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    from examples.train_bert_glue import parse_float_grid
-
-    assert parse_float_grid("1e-5, 2e-5,3e-5") == [1e-5, 2e-5, 3e-5]
-    assert parse_float_grid("0.0 0.01 0.1") == [0.0, 0.01, 0.1]
-    with pytest.raises(ValueError, match="must contain at least one numeric value"):
-        parse_float_grid(" , ")
 
     ckpt_dir = tmp_path / "best_ckpt"
     main(
@@ -376,17 +442,25 @@ def test_main_grid_search_end_to_end_and_checkpoint_persistence(capsys: Any, tmp
         ]
     )
     out = capsys.readouterr().out
-    lines = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    lines = out.rstrip("\n").splitlines()
     assert len(lines) >= 2
-    assert re.match(
-        r"^LR of .+ and weight decay of .+ wins at [0-9]+\.[0-9]{2} F1$",
-        lines[-1],
+    final_line = lines[-1].strip()
+    match = re.match(
+        r"^LR of (?P<lr>.+) and weight decay of (?P<wd>.+) wins at (?P<score>[0-9]+\.[0-9]{2}) F1$",
+        final_line,
     )
+    assert match is not None, f"Final line did not match winner announcement format: {final_line!r}"
 
     assert (ckpt_dir / "model.safetensors").is_file()
     assert (ckpt_dir / "config.json").is_file()
     assert (ckpt_dir / "tokenizer.json").is_file()
     assert (ckpt_dir / "checkpoint_metadata.json").is_file()
+
+    meta = json.loads((ckpt_dir / "checkpoint_metadata.json").read_text(encoding="utf-8"))
+    assert meta["metric_name"] == "f1"
+    assert f"{meta['best_score']:.2f}" == match.group("score")
+    assert "lr" in meta["hyperparameters"]
+    assert "weight_decay" in meta["hyperparameters"]
 
     loaded_model = AutoModelForSequenceClassification.from_pretrained(ckpt_dir)
     loaded_tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
