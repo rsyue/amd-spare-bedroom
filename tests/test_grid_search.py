@@ -388,3 +388,153 @@ def test_virtual_grid_search_distinct_hyperparameter_trajectories(tmp_path: Path
     dict_res = dict_search.run(dict_ds, dict_ds, batch_size=8, epochs=1)
     assert not dict_res.higher_is_better
     assert saver.best_score == pytest.approx(dict_res.best_trial.best_score, abs=1e-6)
+
+
+def test_trial_result_immutability() -> None:
+    """Verify that TrialResult.best_metrics and epoch_metrics dictionaries cannot be mutated."""
+    trial_cfg = TrialConfig(trial_id=0, params={"lr": 1e-4})
+    result = TrialResult(
+        trial=trial_cfg,
+        wave_index=0,
+        assigned_rank=0,
+        epoch_metrics=({"f1": 0.8, "loss": 0.5},),
+        best_epoch=1,
+        best_score=0.8,
+        best_metrics={"f1": 0.8, "loss": 0.5},
+    )
+
+    with pytest.raises(TypeError):
+        result.best_metrics["f1"] = 0.9  # type: ignore[index]
+
+    with pytest.raises(TypeError):
+        result.epoch_metrics[0]["loss"] = 0.1  # type: ignore[index]
+
+
+def test_virtual_grid_search_validations(tmp_path: Path) -> None:
+    """Verify defensive type and boundary checks for VirtualGridSearch.__init__ and run()."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=1)
+    grid = VirtualGrid(world_size=2, total_memory_bytes=2 * 1024**3, device_type="cpu", seed=1)
+
+    # __init__ validations
+    with pytest.raises(TypeError, match="base_model must be an nn.Module"):
+        VirtualGridSearch(base_model="not_a_model", grid=grid, param_grid={"lr": [1e-3]})  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="grid must be a VirtualGrid"):
+        VirtualGridSearch(base_model=base_model, grid="not_a_grid", param_grid={"lr": [1e-3]})  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="seed must be an int"):
+        VirtualGridSearch(base_model=base_model, grid=grid, param_grid={"lr": [1e-3]}, seed=-1)
+
+    with pytest.raises(ValueError, match="max_grad_norm must be a positive finite float"):
+        VirtualGridSearch(
+            base_model=base_model, grid=grid, param_grid={"lr": [1e-3]}, max_grad_norm=-0.5
+        )
+
+    with pytest.raises(TypeError, match="optimizer_cls must be a subclass"):
+        VirtualGridSearch(
+            base_model=base_model,
+            grid=grid,
+            param_grid={"lr": [1e-3]},
+            optimizer_cls=object,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="metric_name must be a non-empty str"):
+        VirtualGridSearch(
+            base_model=base_model, grid=grid, param_grid={"lr": [1e-3]}, metric_name="   "
+        )
+
+    saver = BestCheckpointSaver(tmp_path / "ckpt", metric_name="loss", mode="min")
+    with pytest.raises(ValueError, match="does not match grid search metric"):
+        VirtualGridSearch(
+            base_model=base_model,
+            grid=grid,
+            param_grid={"lr": [1e-3]},
+            metric_name="accuracy",
+            checkpoint_saver=saver,
+        )
+
+    # run() validations
+    search = VirtualGridSearch(base_model=base_model, grid=grid, param_grid={"lr": [1e-3]}, seed=1)
+    with pytest.raises(ValueError, match="epochs must be an int >= 1"):
+        search.run(train_ds, epochs=0)
+
+    with pytest.raises(ValueError, match="batch_size must be an int >= 1"):
+        search.run(train_ds, batch_size=0)
+
+    with pytest.raises(ValueError, match="max_steps must be an int >= 1 or None"):
+        search.run(train_ds, max_steps=0)
+
+    empty_ds = TensorDataset(torch.empty(0, 8), torch.empty(0, dtype=torch.long))
+    with pytest.raises(ValueError, match="train_dataset must not be empty"):
+        search.run(empty_ds)
+
+    with pytest.raises(ValueError, match="eval_dataset must not be empty"):
+        search.run(train_ds, eval_dataset=empty_ds)
+
+
+def test_virtual_grid_search_case_insensitivity_and_non_finite() -> None:
+    """Verify case-insensitive metric normalization and non-finite score handling."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=12)
+    grid = VirtualGrid(world_size=2, total_memory_bytes=2 * 1024**3, device_type="cpu", seed=12)
+
+    # Passing uppercase metric_name "F1" works cleanly
+    search = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid,
+        param_grid={"lr": [1e-3, 5e-2]},
+        metric_name="F1",
+        seed=12,
+    )
+    result = search.run(train_ds, val_ds, batch_size=8, epochs=1)
+    assert result.metric_name == "f1"
+    assert result.best_trial.best_score > 0.0
+
+    # Non-finite score ranking verification
+    assert not search._is_better(float("nan"), 0.5)
+    assert not search._is_better(float("inf"), 0.5)
+    assert search._is_better(0.5, float("nan"))
+    assert search._is_better(0.5, None)
+
+
+def test_virtual_grid_search_amp_dispatch_smoke() -> None:
+    """Verify VirtualGridSearch runs with bfloat16 and float16 AMP modes."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=34)
+    grid = VirtualGrid(world_size=2, total_memory_bytes=2 * 1024**3, device_type="cpu", seed=34)
+
+    search_bf16 = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid,
+        param_grid={"lr": [1e-3, 5e-3]},
+        amp_dtype="bfloat16",
+        seed=34,
+    )
+    res_bf16 = search_bf16.run(train_ds, val_ds, batch_size=8, epochs=1, max_steps=1)
+    assert len(res_bf16.trials) == 2
+
+    search_fp16 = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid,
+        param_grid={"lr": [1e-3, 5e-3]},
+        amp_dtype="float16",
+        seed=34,
+    )
+    res_fp16 = search_fp16.run(train_ds, val_ds, batch_size=8, epochs=1, max_steps=1)
+    assert len(res_fp16.trials) == 2
+
+
+def test_virtual_grid_search_base_model_unmutated() -> None:
+    """Verify that base_model weights remain completely unmutated after search completes."""
+    base_model, train_ds, val_ds = _make_synthetic_classification_data(seed=45)
+    orig_params = {k: v.clone() for k, v in base_model.state_dict().items()}
+
+    grid = VirtualGrid(world_size=2, total_memory_bytes=2 * 1024**3, device_type="cpu", seed=45)
+    search = VirtualGridSearch(
+        base_model=base_model,
+        grid=grid,
+        param_grid={"lr": [1e-2, 5e-2]},
+        seed=45,
+    )
+    search.run(train_ds, val_ds, batch_size=8, epochs=1, max_steps=2)
+
+    for k, v in base_model.state_dict().items():
+        assert torch.equal(v, orig_params[k])

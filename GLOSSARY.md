@@ -63,4 +63,10 @@ flowchart TD
     HG --> TC["TrialConfig\n(trial_id & params)"]
     HG --> WS["WaveSchedule\n(plan_waves)"]
     WS -. "assigns trials per wave" .-> VR
+    VG --> VGS["VirtualGridSearch\n(Trial Execution Engine)"]
+    WS --> VGS
+    VGS --> EVAL
+    VGS --> CKPT
+    VGS --> GSR["GridSearchResult\n(Leaderboard)"]
+    GSR --> TR["TrialResult\n(best_score & epoch_metrics)"]
 ```

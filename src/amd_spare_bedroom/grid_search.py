@@ -23,7 +23,11 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from amd_spare_bedroom.amp import AmpGradScalerState, resolve_amp_dtype
+from amd_spare_bedroom.amp import (
+    ROCM_GRAD_FINITE_BOUND,
+    AmpGradScalerState,
+    resolve_amp_dtype,
+)
 from amd_spare_bedroom.checkpoint import METRIC_DIRECTIONS, BestCheckpointSaver
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
 from amd_spare_bedroom.metrics import AverageMode, compute_classification_metrics
@@ -75,10 +79,19 @@ class TrialResult:
     trial: TrialConfig
     wave_index: int
     assigned_rank: int
-    epoch_metrics: tuple[dict[str, float], ...]
+    epoch_metrics: tuple[Mapping[str, float], ...]
     best_epoch: int
     best_score: float
-    best_metrics: dict[str, float]
+    best_metrics: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.best_metrics, MappingProxyType):
+            object.__setattr__(self, "best_metrics", MappingProxyType(dict(self.best_metrics)))
+        frozen_epoch_metrics = tuple(
+            m if isinstance(m, MappingProxyType) else MappingProxyType(dict(m))
+            for m in self.epoch_metrics
+        )
+        object.__setattr__(self, "epoch_metrics", frozen_epoch_metrics)
 
 
 @dataclass(frozen=True)
@@ -207,12 +220,17 @@ class _RankRNGState:
     cuda_states: list[torch.Tensor] | None
 
     @classmethod
-    def capture(cls) -> _RankRNGState:
+    def capture(cls, device_type: str = "cpu") -> _RankRNGState:
+        capture_cuda = (
+            torch.device(device_type).type == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+        )
         return cls(
             py_state=random.getstate(),
             np_state=np.random.get_state(),
             cpu_state=torch.get_rng_state(),
-            cuda_states=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            cuda_states=torch.cuda.get_rng_state_all() if capture_cuda else None,
         )
 
     def restore(self) -> None:
@@ -262,22 +280,72 @@ class VirtualGridSearch:
         checkpoint_saver: BestCheckpointSaver | None = None,
         optimizer_cls: type[torch.optim.Optimizer] = torch.optim.AdamW,
     ) -> None:
+        """Initialize the multi-rank hyperparameter grid search execution engine.
+
+        Args:
+            base_model: Base neural network module whose initial weights are replicated.
+            grid: VirtualGrid managing emulated ranks and target device.
+            param_grid: Hyperparameter candidate mapping or expanded HyperparameterGrid.
+            metric_name: Validation metric name to optimize (e.g. 'f1', 'loss', 'accuracy').
+            higher_is_better: Whether higher metric values represent improvement.
+            amp_dtype: Optional mixed precision dtype ('bfloat16', 'float16', or None).
+            max_grad_norm: Maximum gradient norm for clipping, or None to disable.
+            seed: Master random seed for deterministic replica and data generator initialization.
+            checkpoint_saver: Optional BestCheckpointSaver to atomically record winning checkpoints.
+            optimizer_cls: Optimizer class instantiated per trial (defaults to torch.optim.AdamW).
+
+        Raises:
+            TypeError: If base_model, grid, or optimizer_cls are of invalid types.
+            ValueError: If metric_name is empty, seed is out of range, max_grad_norm <= 0,
+                or checkpoint_saver monitored metric does not match metric_name.
+        """
+        if not isinstance(base_model, nn.Module):
+            raise TypeError(f"base_model must be an nn.Module, got {type(base_model).__name__}.")
+        if not isinstance(grid, VirtualGrid):
+            raise TypeError(f"grid must be a VirtualGrid, got {type(grid).__name__}.")
+        if isinstance(seed, bool) or not isinstance(seed, int) or not (0 <= seed < 2**32):
+            raise ValueError(f"seed must be an int between 0 and 2**32 - 1, got {seed!r}.")
+        if max_grad_norm is not None:
+            if (
+                isinstance(max_grad_norm, bool)
+                or not isinstance(max_grad_norm, (int, float))
+                or max_grad_norm <= 0
+                or not math.isfinite(max_grad_norm)
+            ):
+                raise ValueError(
+                    f"max_grad_norm must be a positive finite float or None, got {max_grad_norm!r}."
+                )
+        if not (
+            isinstance(optimizer_cls, type) and issubclass(optimizer_cls, torch.optim.Optimizer)
+        ):
+            raise TypeError(
+                f"optimizer_cls must be a subclass of torch.optim.Optimizer, got {optimizer_cls!r}."
+            )
+        if not isinstance(metric_name, str) or not metric_name.strip():
+            raise ValueError(f"metric_name must be a non-empty str, got {metric_name!r}.")
+
         self.grid = grid
         self.hyperparameter_grid = (
             param_grid
             if isinstance(param_grid, HyperparameterGrid)
             else HyperparameterGrid(param_grid)
         )
-        self.metric_name = metric_name
+        self.metric_name = metric_name.strip().lower()
+
+        if checkpoint_saver is not None and checkpoint_saver.metric_name != self.metric_name:
+            raise ValueError(
+                f"checkpoint_saver monitored metric {checkpoint_saver.metric_name!r} "
+                f"does not match grid search metric {self.metric_name!r}."
+            )
         if higher_is_better is not None:
             self.higher_is_better = higher_is_better
-        elif checkpoint_saver is not None and checkpoint_saver.metric_name == metric_name:
+        elif checkpoint_saver is not None:
             self.higher_is_better = checkpoint_saver.mode == "max"
         else:
-            self.higher_is_better = METRIC_DIRECTIONS.get(metric_name, "max") == "max"
+            self.higher_is_better = METRIC_DIRECTIONS.get(self.metric_name, "max") == "max"
 
         self.amp_dtype = resolve_amp_dtype(amp_dtype)
-        self.max_grad_norm = max_grad_norm
+        self.max_grad_norm = float(max_grad_norm) if max_grad_norm is not None else None
         self.seed = seed
         self.checkpoint_saver = checkpoint_saver
         self.optimizer_cls = optimizer_cls
@@ -305,11 +373,15 @@ class VirtualGridSearch:
             device_batch = {
                 k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()
             }
-            labels = cast(torch.Tensor, device_batch.get("labels", device_batch.get("label")))
+            labels = device_batch.get("labels", device_batch.get("label"))
+            if labels is None or not isinstance(labels, torch.Tensor):
+                raise KeyError("Batch mapping must contain a Tensor under 'labels' or 'label' key.")
             outputs: Any = model(**device_batch)
         elif isinstance(batch, (tuple, list)) and len(batch) >= 2:
             inputs = batch[0].to(device) if isinstance(batch[0], torch.Tensor) else batch[0]
             labels = batch[1].to(device) if isinstance(batch[1], torch.Tensor) else batch[1]
+            if not isinstance(labels, torch.Tensor):
+                raise TypeError(f"Batch labels must be a Tensor, got {type(labels).__name__}.")
             outputs = model(inputs)
         else:
             raise TypeError(f"Unsupported batch type for VirtualGridSearch: {type(batch)!r}")
@@ -326,6 +398,9 @@ class VirtualGridSearch:
             loss = cast(torch.Tensor, outputs["loss"])
         else:
             loss = F.cross_entropy(logits, labels)
+
+        if loss.ndim > 0:
+            loss = loss.mean()
 
         return loss, logits.detach().cpu(), labels.detach().cpu()
 
@@ -345,8 +420,18 @@ class VirtualGridSearch:
         try:
             if eval_fn is not None:
                 raw_metrics = eval_fn(model, eval_dataset, batch_size, device, self.amp_dtype)
-                raw_map = raw_metrics.to_dict() if hasattr(raw_metrics, "to_dict") else raw_metrics
-                metrics_dict = {str(k): float(v) for k, v in raw_map.items() if v is not None}
+                if hasattr(raw_metrics, "to_dict"):
+                    raw_map = raw_metrics.to_dict()
+                elif isinstance(raw_metrics, Mapping):
+                    raw_map = raw_metrics
+                else:
+                    raise TypeError(
+                        f"eval_fn must return a Mapping or an object with to_dict(), "
+                        f"got {type(raw_metrics).__name__}."
+                    )
+                metrics_dict = {
+                    str(k).lower(): float(v) for k, v in raw_map.items() if v is not None
+                }
             else:
                 eval_loader: DataLoader[Any] = DataLoader(
                     eval_dataset, batch_size=batch_size, shuffle=False
@@ -368,6 +453,9 @@ class VirtualGridSearch:
                         all_logits.append(logits_cpu)
                         all_labels.append(labels_cpu.reshape(-1))
 
+                if not all_logits:
+                    raise ValueError("Evaluation dataset produced no batches.")
+
                 avg_loss = total_loss / max(total_examples, 1)
                 cls_metrics = replace(
                     compute_classification_metrics(
@@ -378,7 +466,7 @@ class VirtualGridSearch:
                     loss=avg_loss,
                 )
                 metrics_dict = {
-                    k: float(v) for k, v in cls_metrics.to_dict().items() if v is not None
+                    k.lower(): float(v) for k, v in cls_metrics.to_dict().items() if v is not None
                 }
 
             if "loss" in metrics_dict and "eval_loss" not in metrics_dict:
@@ -411,7 +499,7 @@ class VirtualGridSearch:
                 replica=replica,
                 optimizer=optimizer,
                 scaler=scaler,
-                rng=_RankRNGState.capture(),
+                rng=_RankRNGState.capture(self.grid.device_type),
             )
         return states
 
@@ -422,13 +510,17 @@ class VirtualGridSearch:
         with state.scaler.autocast_context():
             loss, _, _ = self._forward_and_loss(state.replica, batch, target_device)
         state.scaler.backward(state.rank, loss)
-        state.scaler.unscale_and_check_finite({state.rank: state.replica.parameters()})
+        is_finite = state.scaler.unscale_and_check_finite({state.rank: state.replica.parameters()})
 
         for param in state.replica.parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                param.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            if param.grad is not None:
+                param.grad.nan_to_num_(
+                    nan=0.0,
+                    posinf=ROCM_GRAD_FINITE_BOUND,
+                    neginf=-ROCM_GRAD_FINITE_BOUND,
+                )
 
-        if self.max_grad_norm is not None and self.max_grad_norm > 0:
+        if is_finite and self.max_grad_norm is not None and self.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(state.replica.parameters(), self.max_grad_norm)
 
         state.scaler.step_optimizers(
@@ -447,11 +539,40 @@ class VirtualGridSearch:
         eval_fn: EvalCallback | None = None,
         average: AverageMode = "auto",
     ) -> GridSearchResult:
-        """Execute all hyperparameter waves and return the aggregated `GridSearchResult`."""
-        if epochs < 1:
-            raise ValueError(f"epochs must be >= 1, got {epochs}.")
-        if batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1, got {batch_size}.")
+        """Execute all hyperparameter waves and return the aggregated `GridSearchResult`.
+
+        Args:
+            train_dataset: Dataset used for per-rank training across epochs.
+            eval_dataset: Dataset used for validation (defaults to train_dataset if None).
+            batch_size: Per-rank batch size for training and evaluation.
+            epochs: Number of training epochs (must be >= 1).
+            max_steps: Maximum training steps per epoch, or None for full epochs.
+            eval_fn: Optional custom evaluation callback taking (model, dataset, ...).
+            average: Averaging mode for classification metrics ('micro', 'macro', 'weighted', 'auto').
+
+        Returns:
+            GridSearchResult containing all completed TrialResult objects, the overall
+            best TrialResult, and leaderboard metadata.
+
+        Raises:
+            ValueError: If epochs < 1, batch_size < 1, max_steps < 1, or datasets are empty.
+            KeyError: If monitored metric_name is missing from evaluation metrics.
+        """
+        if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 1:
+            raise ValueError(f"epochs must be an int >= 1, got {epochs!r}.")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError(f"batch_size must be an int >= 1, got {batch_size!r}.")
+        if max_steps is not None:
+            if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+                raise ValueError(f"max_steps must be an int >= 1 or None, got {max_steps!r}.")
+
+        try:
+            if len(train_dataset) == 0:  # type: ignore[arg-type]
+                raise ValueError("train_dataset must not be empty.")
+            if eval_dataset is not None and len(eval_dataset) == 0:  # type: ignore[arg-type]
+                raise ValueError("eval_dataset must not be empty.")
+        except TypeError:
+            pass
 
         val_dataset = eval_dataset if eval_dataset is not None else train_dataset
         target_device = torch.device(self.grid.device_type)
@@ -487,7 +608,7 @@ class VirtualGridSearch:
                             except StopIteration:
                                 exhausted = True
                             finally:
-                                state.rng = _RankRNGState.capture()
+                                state.rng = _RankRNGState.capture(self.grid.device_type)
                             if exhausted:
                                 break
                         if exhausted:
@@ -498,35 +619,41 @@ class VirtualGridSearch:
                             state = states[rank]
                             state.rng.restore()
                             self._train_step_rank(state, batches[rank], target_device)
-                            state.rng = _RankRNGState.capture()
+                            state.rng = _RankRNGState.capture(self.grid.device_type)
 
                     for rank in wave.active_ranks:
                         state = states[rank]
-                        metrics_dict = self._evaluate_replica(
-                            state=state,
-                            eval_dataset=val_dataset,
-                            batch_size=batch_size,
-                            device=target_device,
-                            average=average,
-                            eval_fn=eval_fn,
-                        )
-                        if self.metric_name not in metrics_dict:
+                        state.rng.restore()
+                        try:
+                            metrics_dict = self._evaluate_replica(
+                                state=state,
+                                eval_dataset=val_dataset,
+                                batch_size=batch_size,
+                                device=target_device,
+                                average=average,
+                                eval_fn=eval_fn,
+                            )
+                        finally:
+                            state.rng = _RankRNGState.capture(self.grid.device_type)
+
+                        norm_metrics = {k.lower(): float(v) for k, v in metrics_dict.items()}
+                        if self.metric_name not in norm_metrics:
                             raise KeyError(
                                 f"Monitored metric {self.metric_name!r} not found in evaluation "
-                                f"metrics {sorted(metrics_dict.keys())}."
+                                f"metrics {sorted(norm_metrics.keys())}."
                             )
-                        score = float(metrics_dict[self.metric_name])
-                        state.epoch_history.append(metrics_dict)
+                        score = float(norm_metrics[self.metric_name])
+                        state.epoch_history.append(norm_metrics)
 
                         if self._is_better(score, state.best_score):
                             state.best_score = score
                             state.best_epoch = epoch + 1
-                            state.best_metrics = dict(metrics_dict)
+                            state.best_metrics = dict(norm_metrics)
 
                         if self.checkpoint_saver is not None:
                             self.checkpoint_saver.save_if_best(
                                 model=state.replica,
-                                metrics=metrics_dict,
+                                metrics=norm_metrics,
                                 epoch=epoch + 1,
                                 hyperparameters=dict(state.trial.params),
                             )
@@ -553,9 +680,16 @@ class VirtualGridSearch:
                         )
                     )
             finally:
+                for s in states.values():
+                    s.optimizer.zero_grad(set_to_none=True)
+                    s.optimizer.state.clear()
+                    s.replica.to("cpu")
                 states.clear()
+                del state
+                del rank_iters
+                del batches
                 gc.collect()
-                if self.grid.device_type == "cuda" and torch.cuda.is_available():
+                if torch.device(self.grid.device_type).type == "cuda" and torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
         best_trial = all_trial_results[0]
