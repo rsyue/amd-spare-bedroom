@@ -38,7 +38,7 @@ Lockstep multi-rank validation evaluation (`evaluate_classification_epoch`) orch
 A persistence manager (`BestCheckpointSaver`) that maintains a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and `checkpoint_metadata.json` directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification) and formatting the winning hyperparameter summary (`BestCheckpointSaver.format_winner_summary`).
 
 ### Virtual Grid Search
-A parallel hyperparameter exploration mode (`VirtualGridSearch`, `HyperparameterGrid`, `WaveSchedule`, `TrialConfig`, `TrialResult`, `GridSearchResult`) in which each Virtual Rank in a `VirtualGrid` executes an independent hyperparameter trial without cross-rank gradient averaging, scheduling $N$ total trials in sequential waves of up to `world_size` concurrent trials.
+A parallel hyperparameter exploration mode (`VirtualGridSearch`, `HyperparameterGrid`, `WaveSchedule`, `TrialConfig`, `TrialResult`, `GridSearchResult`) in which each Virtual Rank in a `VirtualGrid` executes an independent hyperparameter trial without cross-rank gradient averaging, scheduling $N$ total trials in sequential waves of up to `world_size` concurrent trials, persisting a single best loadable checkpoint, and announcing the winning combination on the final stdout line (`GridSearchResult.format_winner_announcement`).
 
 ## Architecture & Concept Relationships
 

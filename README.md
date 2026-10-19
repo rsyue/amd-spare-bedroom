@@ -147,6 +147,9 @@ An end-to-end multi-rank BERT classification training script is provided in [`ex
 # Fast smoke test using synthetic dataset (no network/download required):
 ./hooks/run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
 
+# Multi-rank hyperparameter grid search (5 LRs x 5 weight decays = 25 trials in 3 waves on 10 ranks):
+./hooks/run examples/train_bert_glue.py --grid-search --ranks 10 --use-tiny-bert --checkpoint-dir checkpoints/best_bert
+
 # Full BERT-base sequence classification across 8 virtual ranks with FSDP on SST-2:
 ./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3 --task-name sst2
 ```
@@ -171,7 +174,10 @@ Key CLI options:
 - `--seed`: Random seed for data shuffling, sampling, and model initialization via `seed_everything` (default: 42).
 - `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none`).
 - `--eval-metric`: Metric to monitor for best checkpoint saving (`f1`, `accuracy`, `precision`, `recall`, `loss`; default: `f1`).
-- `--checkpoint-dir` / `--checkpoint-path`: Directory path to save the single best HuggingFace `safetensors` + tokenizer checkpoint.
+- `--checkpoint-dir` / `--checkpoint-path`: Directory path to save the single best HuggingFace `safetensors` + tokenizer checkpoint (default: `None` for standard training, `'checkpoints/best_model'` when `--grid-search` is enabled).
+- `--grid-search`: Enable multi-rank hyperparameter grid search across sequential waves.
+- `--lr-grid`: Comma- or space-separated learning rates to search (default: `1e-5,2e-5,3e-5,5e-5,1e-4`).
+- `--weight-decay-grid`: Comma- or space-separated weight decay values to search (default: `0.0,0.001,0.01,0.05,0.1`).
 
 
 ---
@@ -211,6 +217,7 @@ In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vert
 - **Seam 8: Single Best-Metric Checkpoint Saving (`BestCheckpointSaver`)**: Monitored metric tracking, HuggingFace `safetensors` + tokenizer persistence, atomic directory overwrite, and winning trial formatting.
 - **Seam 9: Hyperparameter Search Space Expansion & Wave Scheduler (`HyperparameterGrid`, `WaveSchedule`, `TrialConfig`)**: Deterministic Cartesian trial expansion, sequential wave partitioning across virtual ranks, and idle rank tracking for partial waves.
 - **Seam 10: Multi-Rank Hyperparameter Grid Search Execution Engine (`VirtualGridSearch`, `TrialResult`, `GridSearchResult`)**: Per-rank replica and optimizer isolation, lockstep wave execution with step limits, evaluation aggregation, and single-best safetensors checkpointing.
+- **Seam 11: CLI Hyperparameter Grid Search & Winner Announcement (`--grid-search`, `format_winner_announcement`)**: Multi-rank wave execution orchestration from CLI, single best-model safetensors persistence, and canonical final-line winner announcement format.
 
 ---
 

@@ -48,6 +48,8 @@ class _BestRecord:
 def _format_hparam_value(val: Any) -> str:
     """Format a hyperparameter number concisely (e.g., 1e-05 -> '1e-5', 1e-4 -> '1e-4', 0.01 -> '0.01')."""
     if isinstance(val, float):
+        if not math.isfinite(val):
+            return str(val)
         if 0 < abs(val) < 0.001 or abs(val) >= 1e5:
             text = f"{val:e}".replace("e-0", "e-").replace("e+0", "e+")
             base, exp = text.split("e")
@@ -80,7 +82,20 @@ class BestCheckpointSaver:
             mode: Comparison mode: 'auto' (inferred from metric name), 'max', or 'min'.
             tokenizer: Optional tokenizer instance to serialize alongside model weights.
         """
-        self.checkpoint_dir = Path(checkpoint_dir).resolve()
+        path_str = str(checkpoint_dir).strip()
+        if not path_str:
+            raise ValueError("checkpoint_dir must be a non-empty directory path.")
+        resolved = Path(checkpoint_dir).resolve()
+        if resolved == Path.cwd():
+            raise ValueError(
+                f"checkpoint_dir cannot be the current working directory ({resolved}). "
+                "Specify a dedicated sub-directory (e.g. 'checkpoints/best_model')."
+            )
+        if resolved == resolved.parent or resolved == Path.home():
+            raise ValueError(
+                f"checkpoint_dir cannot be the filesystem root or home directory ({resolved})."
+            )
+        self.checkpoint_dir = resolved
         self.metric_name = metric_name.strip().lower()
         if mode == "auto":
             if self.metric_name not in METRIC_DIRECTIONS:
@@ -241,13 +256,28 @@ class BestCheckpointSaver:
         """
         spec = _METRIC_SPECS.get(metric_name.lower())
         metric_label = spec.label if spec is not None else metric_name.upper()
-        lr_val = hyperparameters.get("lr", hyperparameters.get("learning_rate", 0.0))
-        wd_val = hyperparameters.get("weight_decay", 0.0)
-        lr_str = _format_hparam_value(lr_val)
-        wd_str = _format_hparam_value(wd_val)
-        return (
-            f"LR of {lr_str} and weight decay of {wd_str} wins at {best_score:.2f} {metric_label}"
+
+        hparams = dict(hyperparameters)
+        lr_key = (
+            "lr" if "lr" in hparams else ("learning_rate" if "learning_rate" in hparams else None)
         )
+        wd_key = "weight_decay" if "weight_decay" in hparams else None
+
+        if lr_key is not None and wd_key is not None and len(hparams) == 2:
+            lr_str = _format_hparam_value(hparams[lr_key])
+            wd_str = _format_hparam_value(hparams[wd_key])
+            return f"LR of {lr_str} and weight decay of {wd_str} wins at {best_score:.2f} {metric_label}"
+
+        parts: list[str] = []
+        if lr_key is not None:
+            parts.append(f"LR of {_format_hparam_value(hparams.pop(lr_key))}")
+        if wd_key is not None:
+            parts.append(f"weight decay of {_format_hparam_value(hparams.pop(wd_key))}")
+        for k, v in sorted(hparams.items()):
+            parts.append(f"{k} of {_format_hparam_value(v)}")
+
+        hparam_str = " and ".join(parts) if parts else "default hyperparameters"
+        return f"{hparam_str} wins at {best_score:.2f} {metric_label}"
 
     def format_winner_summary(self) -> str:
         """Format the winning hyperparameter combination announcement for this saver."""
