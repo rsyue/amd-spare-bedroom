@@ -18,6 +18,11 @@ from amd_spare_bedroom.grid import (
     VirtualGrid,
     seed_everything,
 )
+from amd_spare_bedroom.grid_search import (
+    HyperparameterGrid,
+    TrialConfig,
+    WaveSchedule,
+)
 from amd_spare_bedroom.metrics import (
     ClassificationMetrics,
     compute_classification_metrics,
@@ -32,13 +37,16 @@ __all__ = [
     "AmpGradScalerState",
     "BestCheckpointSaver",
     "ClassificationMetrics",
+    "HyperparameterGrid",
     "ROCM_GRAD_FINITE_BOUND",
+    "TrialConfig",
     "VirtualCommunicator",
     "VirtualDDP",
     "VirtualDevice",
     "VirtualFSDP",
     "VirtualGrid",
     "VirtualRankSampler",
+    "WaveSchedule",
     "compute_classification_metrics",
     "evaluate_classification_epoch",
     "resolve_amp_dtype",

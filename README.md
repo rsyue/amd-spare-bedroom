@@ -94,6 +94,7 @@ flowchart LR
 7. **`AmpGradScalerState` & `resolve_amp_dtype`**: Coordinates Automatic Mixed Precision (`bfloat16`/`float16`) execution with autocast and dynamic loss scaling across virtual ranks.
 8. **`ClassificationMetrics` & `evaluate_classification_epoch`**: Evaluates distributed `VirtualDDP` and `VirtualFSDP` models across ranks without sampler padding distortion, computing `accuracy`, `f1`, `precision`, and `recall` via `scikit-learn`.
 9. **`BestCheckpointSaver`**: Persists a single loadable HuggingFace `safetensors` model (`model.safetensors`, `config.json`), tokenizer, and metadata directory, atomically overwriting it when the monitored metric improves (`f1` by default for classification).
+10. **`HyperparameterGrid` & `WaveSchedule`**: Expands Cartesian hyperparameter candidate search spaces into deterministic `TrialConfig` instances and partitions them into sequential waves of concurrent virtual ranks.
 
 ---
 
@@ -207,6 +208,7 @@ In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vert
 - **Seam 6: `ClassificationMetrics` & Scikit-Learn Adapters**: Zero-division protection, binary/multiclass auto-averaging, and `ClassificationMetrics` dataclass conversions.
 - **Seam 7: Distributed Lockstep Evaluation (`evaluate_classification_epoch`)**: Multi-rank lockstep validation under `eval_forward()`, rank unpadding via `VirtualRankSampler.unstride_and_unpad`, and training state restoration.
 - **Seam 8: Single Best-Metric Checkpoint Saving (`BestCheckpointSaver`)**: Monitored metric tracking, HuggingFace `safetensors` + tokenizer persistence, atomic directory overwrite, and winning trial formatting.
+- **Seam 9: Hyperparameter Search Space Expansion & Wave Scheduler (`HyperparameterGrid`, `WaveSchedule`, `TrialConfig`)**: Deterministic Cartesian trial expansion, sequential wave partitioning across virtual ranks, and idle rank tracking for partial waves.
 
 ---
 
