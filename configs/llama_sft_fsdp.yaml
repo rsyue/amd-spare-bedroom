@@ -1,0 +1,31 @@
+# Llama 3.2 1B Instruction Fine-Tuning using VirtualFSDP (Sharded)
+grid:
+  ranks: 4
+  total_vram_gb: 96.0
+  device: auto
+  seed: 42
+
+training:
+  epochs: 2
+  batch_size: 4
+  lr: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_steps: 0
+  amp: bf16
+
+model:
+  model_name: meta-llama/Llama-3.2-1B
+  use_tiny: false
+  max_seq_length: 256
+
+data:
+  dataset_name: yahma/alpaca-cleaned
+  synthetic: false
+
+parallelism:
+  mode: fsdp
+
+checkpoint:
+  checkpoint_dir: checkpoints/best_llama_sft_fsdp
+  eval_metric: perplexity

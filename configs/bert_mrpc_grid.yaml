@@ -1,0 +1,33 @@
+# Multi-Rank Hyperparameter Grid Search for BERT MRPC
+grid:
+  ranks: 10
+  total_vram_gb: 96.0
+  device: auto
+  seed: 42
+
+training:
+  epochs: 2
+  batch_size: 8
+  max_grad_norm: 1.0
+  max_steps: 0
+  amp: bf16
+
+model:
+  model_name: bert-base-uncased
+  use_tiny: false
+  max_seq_length: 128
+
+data:
+  task_name: mrpc
+  synthetic: false
+
+checkpoint:
+  checkpoint_dir: checkpoints/best_bert_mrpc_grid
+  eval_metric: f1
+
+grid_search:
+  enabled: true
+  params:
+    lr: [1.0e-5, 2.0e-5, 3.0e-5, 5.0e-5, 1.0e-4]
+    weight_decay: [0.0, 0.001, 0.01, 0.05, 0.1]
+    batch_size: [4, 8]
