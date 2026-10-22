@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pytest
+
 from amd_spare_bedroom.config.cli import parse_args_with_config
 
 
@@ -129,3 +131,41 @@ def test_train_llama_sft_parse_args_with_config(tmp_path: Path) -> None:
     assert args.batch_size == 2
     assert args.lr == 5e-5  # Overridden!
     assert args.parallelism == "ddp"
+    # Ensure unmentioned script defaults are not stomped by ExperimentConfig defaults
+    assert args.model_name == "meta-llama/Llama-3.2-1B"
+    assert args.eval_metric == "perplexity"
+
+
+def test_use_tiny_yaml_propagates_to_bert_and_llama(tmp_path: Path) -> None:
+    from examples.train_bert_glue import parse_args as parse_bert_args
+    from examples.train_llama_sft import parse_args as parse_llama_args
+
+    yaml_file = tmp_path / "tiny_config.yaml"
+    yaml_file.write_text(
+        """
+        model:
+          use_tiny: true
+        """,
+        encoding="utf-8",
+    )
+
+    bert_args = parse_bert_args(["--config", str(yaml_file)])
+    assert bert_args.use_tiny_bert is True
+
+    llama_args = parse_llama_args(["--config", str(yaml_file)])
+    assert llama_args.use_tiny_llama is True
+
+
+def test_cli_config_error_handling(tmp_path: Path) -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=1)
+
+    # 1. Non-existent file
+    with pytest.raises(SystemExit):
+        parse_args_with_config(parser, ["--config", str(tmp_path / "nonexistent.yaml")])
+
+    # 2. Corrupt YAML
+    corrupt_file = tmp_path / "corrupt.yaml"
+    corrupt_file.write_text("invalid: yaml: [", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        parse_args_with_config(parser, ["--config", str(corrupt_file)])

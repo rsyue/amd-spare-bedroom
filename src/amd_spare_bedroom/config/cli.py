@@ -11,6 +11,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from amd_spare_bedroom.config.env import load_dotenv
 from amd_spare_bedroom.config.settings import ExperimentConfig, load_config
 
@@ -58,7 +60,44 @@ def parse_args_with_config(
 
     if known.config:
         config_path = Path(known.config)
-        exp_config: ExperimentConfig = load_config(config_path)
+        try:
+            exp_config: ExperimentConfig = load_config(config_path)
+            raw_text = config_path.read_text(encoding="utf-8")
+            raw_yaml = yaml.safe_load(raw_text) or {}
+        except Exception as exc:
+            parser.error(f"Error loading configuration file '{known.config}': {exc}")
+
+        if not isinstance(raw_yaml, dict):
+            raw_yaml = {}
+
+        explicit_keys: set[str] = set()
+        for k, v in raw_yaml.items():
+            k_norm = str(k).replace("-", "_")
+            explicit_keys.add(k_norm)
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    sub_norm = str(sub_k).replace("-", "_")
+                    explicit_keys.add(sub_norm)
+                    if sub_norm == "params" and isinstance(sub_v, dict):
+                        for p_k in sub_v:
+                            explicit_keys.add(f"{str(p_k).replace('-', '_')}_grid")
+
+        # Map domain aliases into explicit keys
+        if "task" in explicit_keys or "task_name" in explicit_keys:
+            explicit_keys.update({"task", "task_name"})
+        if any(k in explicit_keys for k in ("max_seq_length", "max_seq_len", "seq_len")):
+            explicit_keys.update({"max_seq_length", "max_seq_len", "seq_len"})
+        if "checkpoint_dir" in explicit_keys or "checkpoint_path" in explicit_keys:
+            explicit_keys.update({"checkpoint_dir", "checkpoint_path"})
+        if "synthetic" in explicit_keys or "use_synthetic" in explicit_keys:
+            explicit_keys.update({"synthetic", "use_synthetic"})
+        if "mode" in explicit_keys or "parallelism" in explicit_keys:
+            explicit_keys.update({"mode", "parallelism"})
+        if any(k in explicit_keys for k in ("use_tiny", "use_tiny_bert", "use_tiny_llama")):
+            explicit_keys.update({"use_tiny", "use_tiny_bert", "use_tiny_llama"})
+        if "grid_search" in explicit_keys or "enabled" in explicit_keys:
+            explicit_keys.add("grid_search")
+
         flat_defaults = exp_config.to_flat_dict()
 
         # Handle grid search params mapping if specified
@@ -82,10 +121,31 @@ def parse_args_with_config(
 
         # Match flat defaults to parser actions by destination attribute name
         known_dests = {action.dest for action in parser._actions}
+
+        # Propagate use_tiny to destination-specific action names
+        if "use_tiny" in flat_defaults and flat_defaults["use_tiny"] is not None:
+            if "use_tiny_bert" in known_dests:
+                flat_defaults["use_tiny_bert"] = flat_defaults["use_tiny"]
+            if "use_tiny_llama" in known_dests:
+                flat_defaults["use_tiny_llama"] = flat_defaults["use_tiny"]
+
+        # Propagate alias destinations if present
+        if "task_name" in flat_defaults and "task" in known_dests:
+            flat_defaults["task"] = flat_defaults["task_name"]
+        if "max_seq_length" in flat_defaults:
+            if "seq_len" in known_dests:
+                flat_defaults["seq_len"] = flat_defaults["max_seq_length"]
+            if "max_seq_len" in known_dests:
+                flat_defaults["max_seq_len"] = flat_defaults["max_seq_length"]
+        if "checkpoint_dir" in flat_defaults and "checkpoint_path" in known_dests:
+            flat_defaults["checkpoint_path"] = flat_defaults["checkpoint_dir"]
+        if "synthetic" in flat_defaults and "use_synthetic" in known_dests:
+            flat_defaults["use_synthetic"] = flat_defaults["synthetic"]
+
         valid_defaults: dict[str, Any] = {}
         for k, v in flat_defaults.items():
             normalized_key = k.replace("-", "_")
-            if normalized_key in known_dests and v is not None:
+            if normalized_key in explicit_keys and normalized_key in known_dests and v is not None:
                 valid_defaults[normalized_key] = v
 
         if valid_defaults:
