@@ -71,6 +71,14 @@ def parse_args_with_config(
                 flat_defaults["weight_decay_grid"] = ",".join(
                     str(x) for x in exp_config.grid_search.params["weight_decay"]
                 )
+            if "batch_size" in exp_config.grid_search.params:
+                flat_defaults["batch_size_grid"] = ",".join(
+                    str(x) for x in exp_config.grid_search.params["batch_size"]
+                )
+            if "max_grad_norm" in exp_config.grid_search.params:
+                flat_defaults["max_grad_norm_grid"] = ",".join(
+                    str(x) for x in exp_config.grid_search.params["max_grad_norm"]
+                )
 
         # Match flat defaults to parser actions by destination attribute name
         known_dests = {action.dest for action in parser._actions}

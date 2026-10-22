@@ -100,6 +100,35 @@ def parse_float_grid(
     return values
 
 
+def parse_int_grid(
+    raw: str,
+    *,
+    name: str = "grid",
+    min_val: int | None = None,
+    allow_zero: bool = True,
+    allow_negative: bool = False,
+    deduplicate: bool = True,
+) -> list[int]:
+    """Parse a comma- or whitespace-separated string into a validated list of integers."""
+    floats = parse_float_grid(
+        raw,
+        name=name,
+        min_val=float(min_val) if min_val is not None else None,
+        allow_zero=allow_zero,
+        allow_negative=allow_negative,
+        deduplicate=deduplicate,
+    )
+    for val in floats:
+        if not val.is_integer():
+            raise ValueError(f"Values in {name} must be integers, got {val}.")
+    return [int(val) for val in floats]
+
+
+NON_OPTIMIZER_HPARAMS: frozenset[str] = frozenset(
+    {"batch_size", "max_grad_norm", "epochs", "max_steps"}
+)
+
+
 @dataclass(frozen=True)
 class TrialConfig:
     """A single hyperparameter trial configuration in a grid search.
@@ -562,7 +591,8 @@ class VirtualGridSearch:
             replica = copy.deepcopy(self._base_model_template).to(target_device)
             replica.load_state_dict(self._initial_state_dict)
             replica.train()
-            optimizer = self.optimizer_cls(replica.parameters(), **trial.params)
+            opt_kwargs = {k: v for k, v in trial.params.items() if k not in NON_OPTIMIZER_HPARAMS}
+            optimizer = self.optimizer_cls(replica.parameters(), **opt_kwargs)
             scaler = AmpGradScalerState(
                 device_type=self.grid.device_type,
                 ranks=[rank],
@@ -595,8 +625,9 @@ class VirtualGridSearch:
                     neginf=-ROCM_GRAD_FINITE_BOUND,
                 )
 
-        if is_finite and self.max_grad_norm is not None and self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(state.replica.parameters(), self.max_grad_norm)
+        effective_max_grad_norm = state.trial.params.get("max_grad_norm", self.max_grad_norm)
+        if is_finite and effective_max_grad_norm is not None and effective_max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(state.replica.parameters(), effective_max_grad_norm)
 
         state.scaler.step_optimizers(
             {state.rank: state.optimizer},
@@ -663,9 +694,12 @@ class VirtualGridSearch:
                     for rank in wave.active_ranks:
                         gen = torch.Generator()
                         gen.manual_seed(self.seed + epoch)
+                        trial_bs = int(
+                            wave.rank_to_trial[rank].params.get("batch_size", batch_size)
+                        )
                         loader: DataLoader[Any] = DataLoader(
                             train_dataset,
-                            batch_size=batch_size,
+                            batch_size=trial_bs,
                             shuffle=True,
                             generator=gen,
                         )
@@ -699,11 +733,12 @@ class VirtualGridSearch:
                     for rank in wave.active_ranks:
                         state = states[rank]
                         state.rng.restore()
+                        trial_eval_bs = int(state.trial.params.get("batch_size", batch_size))
                         try:
                             metrics_dict = self._evaluate_replica(
                                 state=state,
                                 eval_dataset=val_dataset,
-                                batch_size=batch_size,
+                                batch_size=trial_eval_bs,
                                 device=target_device,
                                 average=average,
                                 eval_fn=eval_fn,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -18,6 +19,7 @@ from amd_spare_bedroom.grid_search import (
     TrialResult,
     VirtualGridSearch,
     WaveSchedule,
+    parse_int_grid,
 )
 
 
@@ -617,3 +619,39 @@ def test_best_checkpoint_saver_path_safety(tmp_path: Path) -> None:
     # Valid sub-directory succeeds
     valid_saver = BestCheckpointSaver(checkpoint_dir=tmp_path / "valid_ckpt")
     assert valid_saver.checkpoint_dir == (tmp_path / "valid_ckpt").resolve()
+
+
+def test_parse_int_grid() -> None:
+    assert parse_int_grid("4, 8, 16") == [4, 8, 16]
+    assert parse_int_grid("2 4 8") == [2, 4, 8]
+    with pytest.raises(ValueError, match="must be integers"):
+        parse_int_grid("2.5, 4")
+
+
+def test_grid_search_multidimensional_with_batch_size(tmp_path: Path) -> None:
+    """Verify VirtualGridSearch supports arbitrary non-optimizer parameters like batch_size."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="cpu", seed=42)
+    base_model, train_data, val_data = _make_synthetic_classification_data(seed=42)
+
+    param_grid: dict[str, list[Any]] = {
+        "lr": [1e-3],
+        "weight_decay": [0.0],
+        "batch_size": [4, 8],
+    }
+    search = VirtualGridSearch(
+        grid=grid,
+        base_model=base_model,
+        param_grid=param_grid,
+        metric_name="accuracy",
+        higher_is_better=True,
+    )
+    result = search.run(
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        epochs=1,
+        max_steps=2,
+    )
+    assert len(result.trials) == 2
+    assert result.best_trial.trial.params["batch_size"] in (4, 8)
+    announcement = result.format_winner_announcement()
+    assert "wins at" in announcement
