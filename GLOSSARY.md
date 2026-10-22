@@ -37,6 +37,13 @@ A persistence manager (`BestCheckpointSaver`) that maintains a single loadable H
 ### Virtual Grid Search
 A parallel hyperparameter exploration mode (`VirtualGridSearch`, `HyperparameterGrid`, `WaveSchedule`, `TrialConfig`, `TrialResult`, `GridSearchResult`) in which each Virtual Rank in a `VirtualGrid` executes an independent hyperparameter trial without cross-rank gradient averaging, scheduling $N$ total trials in sequential waves of up to `world_size` concurrent trials, persisting a single best loadable checkpoint, and announcing the winning combination on the final stdout line (`GridSearchResult.format_winner_announcement`).
 
+### Configuration Schema & Hierarchical Overrides
+Structured Pydantic data models (`ExperimentConfig`, `GridConfig`, `TrainingConfig`, `ModelConfig`, `DataConfig`, `ParallelismConfig`, `CheckpointConfig`, `GridSearchConfig` via `load_config`) and CLI parameter resolution (`parse_args_with_config`) enforcing the precedence order: `CLI Arguments > YAML Config File > Environment Variables (.env) > Code Defaults`.
+
+### Environment Abstraction
+Runtime environment variable management (`load_dotenv`, `find_dotenv`) that discovers and parses `.env` files non-destructively, abstracting AMD ROCm hardware targets (`HSA_OVERRIDE_GFX_VERSION`), PyTorch memory configurations (`PYTORCH_CUDA_ALLOC_CONF`), and HuggingFace cache credentials.
+
+
 ## Architecture & Concept Relationships
 
 ```mermaid
