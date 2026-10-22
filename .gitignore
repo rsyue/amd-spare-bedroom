@@ -54,3 +54,9 @@ dmypy.json
 .scratch/
 scratch/
 tmp/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
