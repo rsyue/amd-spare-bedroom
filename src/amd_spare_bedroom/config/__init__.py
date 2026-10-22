@@ -1,5 +1,9 @@
 """Configuration and environment management for AMD Spare Bedroom."""
 
+from amd_spare_bedroom.config.cli import (
+    add_config_argument,
+    parse_args_with_config,
+)
 from amd_spare_bedroom.config.env import (
     find_dotenv,
     get_env_bool,
@@ -30,6 +34,7 @@ __all__ = [
     "ModelConfig",
     "ParallelismConfig",
     "TrainingConfig",
+    "add_config_argument",
     "find_dotenv",
     "get_env_bool",
     "get_env_float",
@@ -37,5 +42,6 @@ __all__ = [
     "get_env_str",
     "load_config",
     "load_dotenv",
+    "parse_args_with_config",
     "parse_dotenv_content",
 ]

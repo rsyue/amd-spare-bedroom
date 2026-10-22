@@ -28,6 +28,7 @@ from transformers import (
 )
 
 from amd_spare_bedroom.checkpoint import BestCheckpointSaver
+from amd_spare_bedroom.config import parse_args_with_config
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
@@ -391,7 +392,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_WEIGHT_DECAY_GRID_STR,
         help=f"Comma- or space-separated weight decay values for grid search (default: '{DEFAULT_WEIGHT_DECAY_GRID_STR}')",
     )
-    parsed = parser.parse_args(args)
+    parsed = parse_args_with_config(parser, args)
     if parsed.ranks < 1:
         raise ValueError(f"ranks must be >= 1, got {parsed.ranks}")
     if not math.isfinite(parsed.total_vram_gb) or parsed.total_vram_gb <= 0:
