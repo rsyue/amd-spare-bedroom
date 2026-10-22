@@ -132,72 +132,71 @@ To manually install or update ROCm PyTorch wheels for `gfx_1151`:
 uv pip install --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151 torch
 ```
 
+### 3. Environment Configuration (`.env`)
+
+Copy the provided environment template to `.env` to configure ROCm target architectures, memory allocators, and optional HuggingFace access tokens:
+
+```bash
+cp .env.example .env
+```
+
 ---
 
 ## Running Examples
 
-### 1. BERT Sequence Classification on GLUE
+Experiments can be executed using pre-built YAML configurations in [`configs/`](configs/), custom recipes, or direct command-line arguments.
 
-An end-to-end multi-rank BERT classification training script is provided in [`examples/train_bert_glue.py`](examples/train_bert_glue.py), supporting both **FSDP** (parameter sharded) and **DDP** (replicated) on actual GLUE benchmarks or fast in-memory synthetic datasets:
-
-```bash
-# Full BERT fine-tuning across 4 ranks with VirtualFSDP, bfloat16 AMP, gradient clipping, and per-epoch F1 eval:
-./hooks/run examples/train_bert_glue.py --model-name bert-base-uncased --task-name mrpc --parallelism fsdp --ranks 4 --epochs 3 --batch-size 8 --lr 2e-5 --weight-decay 0.01 --max-grad-norm 1.0 --amp bf16 --seed 42 --max-steps 0
-
-# Persist single best HuggingFace safetensors model + tokenizer checkpoint (overwritten when F1 improves):
-./hooks/run examples/train_bert_glue.py --model-name bert-base-uncased --task-name mrpc --parallelism fsdp --ranks 4 --epochs 3 --batch-size 8 --lr 2e-5 --amp bf16 --eval-metric f1 --checkpoint-dir checkpoints/best_bert_mrpc --max-steps 0
-
-# Multi-rank hyperparameter grid search (5 LRs x 5 weight decays = 25 trials in 3 waves on 10 ranks with final announcement):
-./hooks/run examples/train_bert_glue.py --grid-search --ranks 10 --task-name mrpc --epochs 2 --batch-size 8 --eval-metric f1 --checkpoint-dir checkpoints/best_bert_grid --max-steps 0
-
-# Full BERT-base sequence classification across 8 virtual ranks with FSDP on SST-2:
-./hooks/run examples/train_bert_glue.py --parallelism fsdp --ranks 8 --batch-size 4 --epochs 3 --task-name sst2
-
-# Fast smoke test using synthetic dataset (no network/download required):
-./hooks/run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
-```
-
-### 2. Llama 3.2 1B Supervised Fine-Tuning (SFT)
-
-A complete Causal Language Model Supervised Fine-Tuning script is provided in [`examples/train_llama_sft.py`](examples/train_llama_sft.py), supporting full-parameter instruction fine-tuning targeting `meta-llama/Llama-3.2-1B` with sharded **VirtualFSDP**, replicated **VirtualDDP**, automatic mixed precision (`bf16`), per-epoch validation perplexity and token accuracy evaluation, single best-checkpoint overwriting, and multi-rank grid search:
+### 1. Quick Start with YAML Recipes
 
 ```bash
-# Full instruction SFT on Llama 3.2 1B with VirtualFSDP across 4 virtual ranks with bfloat16 AMP:
-./hooks/run examples/train_llama_sft.py --model-name meta-llama/Llama-3.2-1B --dataset-name yahma/alpaca-cleaned --parallelism fsdp --ranks 4 --epochs 2 --batch-size 4 --lr 2e-5 --weight-decay 0.01 --max-grad-norm 1.0 --amp bf16 --eval-metric perplexity --checkpoint-dir checkpoints/best_llama_sft --max-steps 0
+# BERT sequence classification on MRPC using replicated VirtualDDP (4 ranks):
+uv run examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml
 
-# Multi-rank hyperparameter grid search evaluating Validation Perplexity across sequential waves:
-./hooks/run examples/train_llama_sft.py --grid-search --model-name meta-llama/Llama-3.2-1B --dataset-name yahma/alpaca-cleaned --ranks 4 --lr-grid 1e-5,2e-5,5e-5 --weight-decay-grid 0.0,0.01 --eval-metric perplexity --checkpoint-dir checkpoints/best_llama_grid --max-steps 0
+# BERT sequence classification on MRPC using sharded VirtualFSDP (4 ranks):
+uv run examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml
 
-# Fast local smoke test with compact 2-layer Llama on synthetic data (offline, no HF credentials needed):
-./hooks/run examples/train_llama_sft.py --use-tiny-llama --synthetic --ranks 2 --epochs 2 --max-steps 2
+# Llama 3.2 1B instruction fine-tuning using sharded VirtualFSDP (4 ranks):
+uv run examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml
+
+# Multi-rank hyperparameter grid search across LR, weight decay, and batch size:
+uv run examples/train_bert_glue.py --config configs/bert_mrpc_grid.yaml
 ```
 
-### Key CLI Options
+### 2. Overriding Configuration Parameters on the Fly
 
-- `--parallelism`: Distributed mode (`fsdp` for sharded memory, `ddp` for replicated; default: `fsdp`).
-- `--synthetic` / `--use-synthetic`: Use fast in-memory synthetic dataset instead of downloading external datasets.
-- `--ranks`: Number of virtual devices/ranks to emulate in the grid (default: 4).
-- `--total-vram-gb`: Physical VRAM memory pool allocation in GB (default: 96.0).
-- `--device`: Target device type (`cuda`, `cpu`, or auto-detected; default: auto-detect).
-- `--model-name`: HuggingFace model identifier (default: `bert-base-uncased` for BERT, `meta-llama/Llama-3.2-1B` for SFT).
-- `--use-tiny-bert` / `--use-tiny-llama`: Use compact 2-layer model for fast verification and CI.
-- `--task-name` / `--task`: GLUE task for sequence classification (`mrpc`, `sst2`, `cola`, `qqp`, `mnli`, `qnli`, `rte`, `wnli`, `stsb`; default: `mrpc`).
-- `--dataset-name`: HuggingFace instruction dataset name for SFT (default: `yahma/alpaca-cleaned`).
-- `--dataset-size`: Sample cap (default: full dataset, or 64 if `--synthetic`).
-- `--max-seq-length` / `--seq-len`: Maximum sequence length (default: 128 for BERT, 256 for SFT).
-- `--max-steps`: Maximum training steps per epoch (`<= 0` for full epoch; default: 5).
-- `--epochs`: Number of training epochs (default: 2).
-- `--batch-size`: Per-rank batch size (default: 8 for BERT, 4 for SFT).
-- `--lr`: Optimizer learning rate (default: 2e-5).
-- `--weight-decay`: Weight decay for AdamW optimizer (default: 0.01).
-- `--max-grad-norm`: Maximum gradient norm threshold for clipping (default: 1.0).
-- `--seed`: Random seed for data shuffling, sampling, and model initialization via `seed_everything` (default: 42).
-- `--amp` / `--precision`: Automatic mixed precision mode (`none`/`fp32`, `bf16`/`bfloat16`, `fp16`/`float16`; default: `none` on CPU / `bf16` on GPU).
-- `--eval-metric`: Metric to monitor for best checkpoint saving (`f1`, `accuracy`, `precision`, `recall`, `loss`, `perplexity`, `token_accuracy`, `eval_loss`; default: `f1` for BERT, `perplexity` for SFT).
-- `--checkpoint-dir` / `--checkpoint-path`: Directory path to save the single best HuggingFace `safetensors` + tokenizer checkpoint (default: `None` for standard training, `'checkpoints/best_model'` when `--grid-search` is enabled).
-- `--grid-search`: Enable multi-rank hyperparameter grid search across sequential waves.
-- `--lr-grid`: Comma- or space-separated learning rates to search (default: `1e-5,2e-5,3e-5,5e-5,1e-4`).
-- `--weight-decay-grid`: Comma- or space-separated weight decay values to search (default: `0.0,0.001,0.01,0.05,0.1`).
+You can selectively override any parameter on the command line without modifying the YAML file:
+
+```bash
+# Launch BERT with batch size 16 and learning rate 5e-5:
+uv run examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml --batch-size 16 --lr 5e-5
+
+# Evaluate across 8 virtual ranks on SST-2:
+uv run examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml --ranks 8 --task-name sst2
+```
+
+### 3. Direct Command-Line Launch (Bypassing YAML)
+
+If preferred, you can still launch scripts entirely with direct arguments:
+
+```bash
+uv run examples/train_bert_glue.py --model-name bert-base-uncased --task-name mrpc --parallelism fsdp --ranks 4 --epochs 3 --batch-size 8 --lr 2e-5 --amp bf16 --eval-metric f1 --checkpoint-dir checkpoints/best_bert_mrpc --max-steps 0
+```
+
+### 4. Fast Local Smoke Tests (Offline / No Downloads)
+
+```bash
+# BERT classification smoke test with compact 2-layer model and synthetic data:
+uv run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
+
+# Llama 3.2 1B SFT smoke test with compact 2-layer model and synthetic data:
+uv run examples/train_llama_sft.py --synthetic --use-tiny-llama --ranks 2 --max-steps 2
+```
+
+---
+
+## Configuration & CLI Options Reference
+
+For a complete catalog of all configuration keys, environment variables, command-line arguments, precedence rules, and custom recipe instructions, see [`configs/README.md`](configs/README.md).
 
 ---
 
