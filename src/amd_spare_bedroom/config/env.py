@@ -69,12 +69,22 @@ def find_dotenv(
     filename: str = ".env",
     start_dir: str | Path | None = None,
 ) -> Path | None:
-    """Search for a .env file starting at start_dir and walking up parent directories."""
+    """Search for a .env file starting at start_dir and walking up parent directories.
+
+    Stops walking upward when encountering repository boundary markers (.git or pyproject.toml)
+    or the filesystem root.
+    """
+    filename_path = Path(filename)
+    if filename_path.is_absolute() or len(filename_path.parts) > 1:
+        raise ValueError(f"filename must be a plain filename, got: {filename!r}")
+
     current = Path(start_dir).resolve() if start_dir is not None else Path.cwd().resolve()
     for parent in [current, *current.parents]:
         target = parent / filename
         if target.is_file():
             return target
+        if (parent / ".git").exists() or (parent / "pyproject.toml").is_file():
+            break
     return None
 
 
@@ -142,6 +152,6 @@ def get_env_float(name: str, default: float = 0.0) -> float:
 def get_env_bool(name: str, default: bool = False) -> bool:
     """Retrieve an environment variable as a boolean."""
     val = os.environ.get(name)
-    if val is None:
+    if val is None or not val.strip():
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")

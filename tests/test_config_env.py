@@ -130,3 +130,33 @@ def test_typed_getters_invalid_values(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(ValueError, match="cannot be parsed as float"):
         get_env_float("BAD_FLOAT")
+
+
+def test_find_dotenv_invalid_filename() -> None:
+    with pytest.raises(ValueError, match="plain filename"):
+        find_dotenv(filename="/etc/shadow")
+
+    with pytest.raises(ValueError, match="plain filename"):
+        find_dotenv(filename="../secret.env")
+
+
+def test_find_dotenv_stops_at_repo_boundary(tmp_path: Path) -> None:
+    outer_env = tmp_path / ".env"
+    outer_env.write_text("OUTER=true\n", encoding="utf-8")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    deep_dir = repo_root / "src" / "pkg"
+    deep_dir.mkdir(parents=True)
+
+    assert find_dotenv(start_dir=deep_dir) is None
+
+
+def test_get_env_bool_empty_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EMPTY_BOOL", "")
+    monkeypatch.setenv("WHITESPACE_BOOL", "   ")
+
+    assert get_env_bool("EMPTY_BOOL", default=True) is True
+    assert get_env_bool("WHITESPACE_BOOL", default=True) is True

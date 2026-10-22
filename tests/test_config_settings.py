@@ -168,3 +168,35 @@ def test_validation_errors() -> None:
     with pytest.raises(ValidationError):
         # lr must be positive
         ExperimentConfig(training=TrainingConfig(lr=-1.0))
+
+    with pytest.raises(ValidationError):
+        # amp must be valid literal
+        TrainingConfig(amp="unsupported_amp")  # type: ignore[arg-type]
+
+
+def test_load_config_with_nested_overrides_preserves_siblings(tmp_path: Path) -> None:
+    yaml_content = """
+    training:
+      epochs: 4
+      batch_size: 16
+      amp: bf16
+    """
+    yaml_file = tmp_path / "test_nested.yaml"
+    yaml_file.write_text(yaml_content, encoding="utf-8")
+
+    cfg = load_config(yaml_file, overrides={"training": {"lr": 1e-4}})
+    assert cfg.training.epochs == 4
+    assert cfg.training.batch_size == 16
+    assert cfg.training.amp == "bf16"
+    assert cfg.training.lr == 1e-4
+
+
+def test_grid_config_env_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AMD_SPARE_BEDROOM_TOTAL_VRAM_GB", "48.0")
+    monkeypatch.setenv("AMD_SPARE_BEDROOM_DEVICE", "cpu")
+    monkeypatch.setenv("AMD_SPARE_BEDROOM_SEED", "123")
+
+    grid = GridConfig()
+    assert grid.total_vram_gb == 48.0
+    assert grid.device == "cpu"
+    assert grid.seed == 123

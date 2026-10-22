@@ -12,18 +12,27 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
+from amd_spare_bedroom.config.env import get_env_float, get_env_int, get_env_str
+
 
 class GridConfig(BaseModel):
     """Cluster topology, hardware budgeting, and seed configuration."""
 
     ranks: int = Field(default=4, ge=1, description="Number of virtual ranks to emulate.")
     total_vram_gb: float = Field(
-        default=96.0, gt=0.0, description="Total physical VRAM pool budget in GB."
+        default_factory=lambda: get_env_float("AMD_SPARE_BEDROOM_TOTAL_VRAM_GB", 96.0),
+        gt=0.0,
+        description="Total physical VRAM pool budget in GB.",
     )
     device: str = Field(
-        default="auto", description="Execution device backend ('auto', 'cuda', 'cpu')."
+        default_factory=lambda: get_env_str("AMD_SPARE_BEDROOM_DEVICE", "auto"),
+        description="Execution device backend ('auto', 'cuda', 'cpu').",
     )
-    seed: int = Field(default=42, ge=0, description="Deterministic random seed.")
+    seed: int = Field(
+        default_factory=lambda: get_env_int("AMD_SPARE_BEDROOM_SEED", 42),
+        ge=0,
+        description="Deterministic random seed.",
+    )
 
 
 class TrainingConfig(BaseModel):
@@ -39,9 +48,9 @@ class TrainingConfig(BaseModel):
     max_steps: int = Field(
         default=5, description="Maximum training steps per epoch (<=0 for full epoch)."
     )
-    amp: str = Field(
+    amp: Literal["none", "fp32", "float32", "bf16", "bfloat16", "fp16", "float16"] = Field(
         default="none",
-        description="Automatic mixed precision mode ('none', 'bf16', 'fp16').",
+        description="Automatic mixed precision mode ('none'/'fp32', 'bf16'/'bfloat16', 'fp16'/'float16').",
     )
 
 
@@ -228,6 +237,16 @@ class ExperimentConfig(BaseModel):
         }
 
 
+def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge update dictionary into base dictionary in-place."""
+    for key, val in update.items():
+        if isinstance(val, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], val)
+        else:
+            base[key] = val
+    return base
+
+
 def load_config(
     path: str | Path,
     overrides: dict[str, Any] | None = None,
@@ -259,6 +278,6 @@ def load_config(
         raise ValueError(f"Configuration file {file_path} must define a YAML mapping/dictionary.")
 
     if overrides:
-        parsed.update(overrides)
+        _deep_update(parsed, overrides)
 
     return ExperimentConfig.from_dict(parsed)
