@@ -624,8 +624,15 @@ def test_best_checkpoint_saver_path_safety(tmp_path: Path) -> None:
 def test_parse_int_grid() -> None:
     assert parse_int_grid("4, 8, 16") == [4, 8, 16]
     assert parse_int_grid("2 4 8") == [2, 4, 8]
+    assert parse_int_grid("1, 2, 4", name="--batch-size-grid", min_val=1, allow_zero=True) == [
+        1,
+        2,
+        4,
+    ]
     with pytest.raises(ValueError, match="must be integers"):
         parse_int_grid("2.5, 4")
+    with pytest.raises(ValueError, match=r"must be >= 1"):
+        parse_int_grid("0, 2, 4", name="--batch-size-grid", min_val=1, allow_zero=True)
 
 
 def test_grid_search_multidimensional_with_batch_size(tmp_path: Path) -> None:
@@ -655,3 +662,41 @@ def test_grid_search_multidimensional_with_batch_size(tmp_path: Path) -> None:
     assert result.best_trial.trial.params["batch_size"] in (4, 8)
     announcement = result.format_winner_announcement()
     assert "wins at" in announcement
+
+
+def test_grid_search_heterogeneous_batch_size_full_epoch() -> None:
+    """Verify that trials with smaller batch sizes do not get starved when larger batch sizes exhaust."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="cpu", seed=42)
+    base_model, train_data, val_data = _make_synthetic_classification_data(seed=42)
+
+    param_grid: dict[str, list[Any]] = {
+        "lr": [1e-3],
+        "weight_decay": [0.0],
+        "batch_size": [4, 8],
+    }
+    search = VirtualGridSearch(
+        grid=grid,
+        base_model=base_model,
+        param_grid=param_grid,
+        metric_name="accuracy",
+        higher_is_better=True,
+    )
+    step_counts: dict[int, int] = {0: 0, 1: 0}
+    orig_step = search._train_step_rank
+
+    def counting_step(state: Any, batch: Any, device: torch.device) -> None:
+        step_counts[state.rank] += 1
+        orig_step(state, batch, device)
+
+    search._train_step_rank = counting_step  # type: ignore[assignment]
+
+    result = search.run(
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        epochs=1,
+        max_steps=None,
+    )
+    assert len(result.trials) == 2
+    # 24 samples: batch_size=4 takes 6 steps; batch_size=8 takes 3 steps
+    assert step_counts[0] == 6
+    assert step_counts[1] == 3

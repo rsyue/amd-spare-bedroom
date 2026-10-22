@@ -705,30 +705,39 @@ class VirtualGridSearch:
                         )
                         rank_iters[rank] = iter(loader)
 
-                    step = 0
-                    while not has_max_steps or (max_steps is not None and step < max_steps):
+                    active_ranks = set(wave.active_ranks)
+                    rank_step_counts = {r: 0 for r in wave.active_ranks}
+
+                    while active_ranks:
                         batches: dict[int, Any] = {}
-                        exhausted = False
-                        for rank in wave.active_ranks:
+                        exhausted_ranks: list[int] = []
+
+                        for rank in list(active_ranks):
+                            if (
+                                has_max_steps
+                                and max_steps is not None
+                                and rank_step_counts[rank] >= max_steps
+                            ):
+                                active_ranks.remove(rank)
+                                continue
                             state = states[rank]
                             state.rng.restore()
                             try:
                                 batches[rank] = next(rank_iters[rank])
                             except StopIteration:
-                                exhausted = True
+                                exhausted_ranks.append(rank)
                             finally:
                                 state.rng = _RankRNGState.capture(self.grid.device_type)
-                            if exhausted:
-                                break
-                        if exhausted:
-                            break
 
-                        step += 1
-                        for rank in wave.active_ranks:
+                        for rank in exhausted_ranks:
+                            active_ranks.discard(rank)
+
+                        for rank, batch in batches.items():
                             state = states[rank]
                             state.rng.restore()
-                            self._train_step_rank(state, batches[rank], target_device)
+                            self._train_step_rank(state, batch, target_device)
                             state.rng = _RankRNGState.capture(self.grid.device_type)
+                            rank_step_counts[rank] += 1
 
                     for rank in wave.active_ranks:
                         state = states[rank]

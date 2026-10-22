@@ -454,7 +454,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
                 parsed.batch_size_grid,
                 name="--batch-size-grid",
                 min_val=1,
-                allow_zero=False,
+                allow_zero=True,
             )
         if parsed.max_grad_norm_grid:
             parse_float_grid(
