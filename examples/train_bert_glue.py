@@ -29,6 +29,7 @@ from transformers import (
 
 from amd_spare_bedroom import seed_everything
 from amd_spare_bedroom.checkpoint import BestCheckpointSaver
+from amd_spare_bedroom.config import parse_args_with_config
 from amd_spare_bedroom.ddp import VirtualDDP
 from amd_spare_bedroom.fsdp import VirtualFSDP
 from amd_spare_bedroom.grid import VirtualGrid
@@ -37,6 +38,7 @@ from amd_spare_bedroom.grid_search import (
     DEFAULT_WEIGHT_DECAY_GRID_STR,
     VirtualGridSearch,
     parse_float_grid,
+    parse_int_grid,
 )
 from amd_spare_bedroom.metrics import evaluate_classification_epoch
 from amd_spare_bedroom.sampler import VirtualRankSampler
@@ -326,7 +328,19 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_WEIGHT_DECAY_GRID_STR,
         help=f"Comma- or space-separated weight decay values for grid search (default: '{DEFAULT_WEIGHT_DECAY_GRID_STR}')",
     )
-    parsed = parser.parse_args(args)
+    parser.add_argument(
+        "--batch-size-grid",
+        type=str,
+        default=None,
+        help="Comma- or space-separated batch sizes for grid search (e.g. '4,8')",
+    )
+    parser.add_argument(
+        "--max-grad-norm-grid",
+        type=str,
+        default=None,
+        help="Comma- or space-separated max grad norm thresholds for grid search",
+    )
+    parsed = parse_args_with_config(parser, args)
     if not math.isfinite(parsed.lr) or parsed.lr <= 0:
         raise ValueError(f"lr must be a positive finite float, got {parsed.lr}")
     if not math.isfinite(parsed.weight_decay) or parsed.weight_decay < 0:
@@ -351,14 +365,28 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             parsed.lr_grid,
             name="--lr-grid",
             min_val=0.0,
-            allow_zero=False,
+            inclusive=False,
         )
         parse_float_grid(
             parsed.weight_decay_grid,
             name="--weight-decay-grid",
             min_val=0.0,
-            allow_zero=True,
+            inclusive=True,
         )
+        if parsed.batch_size_grid:
+            parse_int_grid(
+                parsed.batch_size_grid,
+                name="--batch-size-grid",
+                min_val=1,
+                inclusive=True,
+            )
+        if parsed.max_grad_norm_grid:
+            parse_float_grid(
+                parsed.max_grad_norm_grid,
+                name="--max-grad-norm-grid",
+                min_val=0.0,
+                inclusive=True,
+            )
     return parsed
 
 
@@ -510,7 +538,19 @@ def main(argv: list[str] | None = None) -> None:
     if args.grid_search:
         lrs = parse_float_grid(args.lr_grid, name="--lr-grid")
         weight_decays = parse_float_grid(args.weight_decay_grid, name="--weight-decay-grid")
-        total_trials = len(lrs) * len(weight_decays)
+        search_space: dict[str, list[Any]] = {
+            "lr": lrs,
+            "weight_decay": weight_decays,
+        }
+        if args.batch_size_grid:
+            search_space["batch_size"] = parse_int_grid(
+                args.batch_size_grid, name="--batch-size-grid", min_val=1, inclusive=True
+            )
+        if args.max_grad_norm_grid:
+            search_space["max_grad_norm"] = parse_float_grid(
+                args.max_grad_norm_grid, name="--max-grad-norm-grid", min_val=0.0, inclusive=True
+            )
+        total_trials = math.prod(len(v) for v in search_space.values())
         print(
             f"[*] Running VirtualGridSearch: {total_trials} trials across {grid.world_size} virtual ranks"
         )
@@ -518,7 +558,7 @@ def main(argv: list[str] | None = None) -> None:
         search = VirtualGridSearch(
             base_model=base_model,
             grid=grid,
-            param_grid={"lr": lrs, "weight_decay": weight_decays},
+            param_grid=search_space,
             metric_name=args.eval_metric,
             amp_dtype=args.amp,
             max_grad_norm=args.max_grad_norm if args.max_grad_norm > 0 else None,
@@ -530,7 +570,7 @@ def main(argv: list[str] | None = None) -> None:
             eval_dataset=eval_dataset,
             batch_size=args.batch_size,
             epochs=args.epochs,
-            max_steps=args.max_steps,
+            max_steps=args.max_steps if args.max_steps > 0 else None,
         )
         print(
             f"[*] Grid search completed {len(result.trials)} trials in {result.num_waves} wave(s)."

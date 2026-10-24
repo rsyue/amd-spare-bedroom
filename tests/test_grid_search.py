@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
 from torch import nn
-from torch.utils.data import Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from amd_spare_bedroom.checkpoint import BestCheckpointSaver
 from amd_spare_bedroom.grid import VirtualGrid, seed_everything
@@ -18,6 +19,7 @@ from amd_spare_bedroom.grid_search import (
     TrialResult,
     VirtualGridSearch,
     WaveSchedule,
+    parse_int_grid,
 )
 
 
@@ -617,3 +619,125 @@ def test_best_checkpoint_saver_path_safety(tmp_path: Path) -> None:
     # Valid sub-directory succeeds
     valid_saver = BestCheckpointSaver(checkpoint_dir=tmp_path / "valid_ckpt")
     assert valid_saver.checkpoint_dir == (tmp_path / "valid_ckpt").resolve()
+
+
+def test_parse_int_grid() -> None:
+    assert parse_int_grid("4, 8, 16") == [4, 8, 16]
+    assert parse_int_grid("2 4 8") == [2, 4, 8]
+    assert parse_int_grid("1, 2, 4", name="--batch-size-grid", min_val=1, inclusive=True) == [
+        1,
+        2,
+        4,
+    ]
+    with pytest.raises(ValueError, match="must be integers"):
+        parse_int_grid("2.5, 4")
+    with pytest.raises(ValueError, match=r"must be >= 1"):
+        parse_int_grid("0, 2, 4", name="--batch-size-grid", min_val=1, inclusive=True)
+
+
+def test_hyperparameter_grid_cardinality_limit() -> None:
+    with pytest.raises(ValueError, match="exceeding maximum permitted safety bound"):
+        HyperparameterGrid({"p1": list(range(1000)), "p2": list(range(200))})
+
+
+def test_forward_and_loss_without_logits() -> None:
+    base_model, train_data, _ = _make_synthetic_classification_data(seed=42)
+    device = torch.device("cpu")
+    batch = next(iter(DataLoader(train_data, batch_size=4)))
+    loss, logits, labels = VirtualGridSearch._forward_and_loss(
+        base_model, batch, device, return_logits=False
+    )
+    assert isinstance(loss, torch.Tensor)
+    assert logits is None
+    assert labels is None
+
+
+def test_grid_search_max_steps_none_full_epoch() -> None:
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="cpu", seed=42)
+    base_model, train_data, val_data = _make_synthetic_classification_data(seed=42)
+
+    param_grid: dict[str, list[Any]] = {
+        "lr": [1e-3],
+        "weight_decay": [0.0],
+    }
+    search = VirtualGridSearch(
+        grid=grid,
+        base_model=base_model,
+        param_grid=param_grid,
+        metric_name="accuracy",
+        higher_is_better=True,
+    )
+    result = search.run(
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        epochs=1,
+        max_steps=None,  # None indicates full epoch
+    )
+    assert len(result.trials) == 1
+
+
+def test_grid_search_multidimensional_with_batch_size(tmp_path: Path) -> None:
+    """Verify VirtualGridSearch supports arbitrary non-optimizer parameters like batch_size."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="cpu", seed=42)
+    base_model, train_data, val_data = _make_synthetic_classification_data(seed=42)
+
+    param_grid: dict[str, list[Any]] = {
+        "lr": [1e-3],
+        "weight_decay": [0.0],
+        "batch_size": [4, 8],
+    }
+    search = VirtualGridSearch(
+        grid=grid,
+        base_model=base_model,
+        param_grid=param_grid,
+        metric_name="accuracy",
+        higher_is_better=True,
+    )
+    result = search.run(
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        epochs=1,
+        max_steps=2,
+    )
+    assert len(result.trials) == 2
+    assert result.best_trial.trial.params["batch_size"] in (4, 8)
+    announcement = result.format_winner_announcement()
+    assert "wins at" in announcement
+
+
+def test_grid_search_heterogeneous_batch_size_full_epoch() -> None:
+    """Verify that trials with smaller batch sizes do not get starved when larger batch sizes exhaust."""
+    grid = VirtualGrid.create(world_size=2, total_memory_gb=16.0, device_type="cpu", seed=42)
+    base_model, train_data, val_data = _make_synthetic_classification_data(seed=42)
+
+    param_grid: dict[str, list[Any]] = {
+        "lr": [1e-3],
+        "weight_decay": [0.0],
+        "batch_size": [4, 8],
+    }
+    search = VirtualGridSearch(
+        grid=grid,
+        base_model=base_model,
+        param_grid=param_grid,
+        metric_name="accuracy",
+        higher_is_better=True,
+    )
+    step_counts: dict[int, int] = {0: 0, 1: 0}
+    orig_step = search._train_step_rank
+
+    def counting_step(state: Any, batch: Any, device: torch.device) -> None:
+        step_counts[state.rank] += 1
+        orig_step(state, batch, device)
+
+    search._train_step_rank = counting_step  # type: ignore[assignment]
+
+    result = search.run(
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        epochs=1,
+        max_steps=None,
+    )
+    assert len(result.trials) == 2
+    # 24 samples: batch_size=4 takes 6 steps; batch_size=8 takes 3 steps
+    assert step_counts[0] == 6
+    assert step_counts[1] == 3

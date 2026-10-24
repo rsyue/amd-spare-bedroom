@@ -1,0 +1,33 @@
+# Multi-Rank Hyperparameter Grid Search for Llama 3.2 1B SFT
+grid:
+  ranks: 4
+  total_vram_gb: 96.0
+  device: auto
+  seed: 42
+
+training:
+  epochs: 1
+  batch_size: 4
+  max_grad_norm: 1.0
+  max_steps: 0
+  amp: bf16
+
+model:
+  model_name: meta-llama/Llama-3.2-1B
+  use_tiny: false
+  max_seq_length: 256
+
+data:
+  dataset_name: yahma/alpaca-cleaned
+  synthetic: false
+
+checkpoint:
+  checkpoint_dir: checkpoints/best_llama_sft_grid
+  eval_metric: perplexity
+
+grid_search:
+  enabled: true
+  params:
+    lr: [1.0e-5, 2.0e-5, 5.0e-5]
+    weight_decay: [0.0, 0.01]
+    batch_size: [2, 4]

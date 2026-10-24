@@ -15,7 +15,7 @@ import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 
 import numpy as np
 import torch
@@ -42,6 +42,7 @@ def parse_float_grid(
     name: str = "grid",
     min_val: float | None = None,
     allow_zero: bool = True,
+    inclusive: bool | None = None,
     allow_negative: bool = False,
     deduplicate: bool = True,
 ) -> list[float]:
@@ -51,7 +52,8 @@ def parse_float_grid(
         raw: Comma- and/or whitespace-delimited string of float values.
         name: Name of the parameter or CLI flag for error messaging.
         min_val: Optional minimum value threshold.
-        allow_zero: Whether zero is allowed when min_val is 0.0.
+        allow_zero: Whether zero is allowed when min_val is 0.0 (kept for backwards compatibility).
+        inclusive: Whether min_val boundary is inclusive (val >= min_val) or strict (val > min_val).
         allow_negative: Whether negative values are allowed.
         deduplicate: Whether to remove duplicate values while preserving order.
 
@@ -69,6 +71,8 @@ def parse_float_grid(
     if not tokens:
         raise ValueError(f"{name} must contain at least one numeric value.")
 
+    is_inclusive = inclusive if inclusive is not None else allow_zero
+
     values: list[float] = []
     seen: set[float] = set()
     for tok in tokens:
@@ -84,11 +88,11 @@ def parse_float_grid(
             raise ValueError(f"{name} values must be non-negative, got {val}.")
 
         if min_val is not None:
-            if not allow_zero and val <= min_val:
+            if not is_inclusive and val <= min_val:
                 raise ValueError(
                     f"Values in {name} must be strictly greater than {min_val}, got {val}."
                 )
-            if allow_zero and val < min_val:
+            if is_inclusive and val < min_val:
                 raise ValueError(f"Values in {name} must be >= {min_val}, got {val}.")
 
         if deduplicate:
@@ -98,6 +102,37 @@ def parse_float_grid(
         values.append(val)
 
     return values
+
+
+def parse_int_grid(
+    raw: str,
+    *,
+    name: str = "grid",
+    min_val: int | None = None,
+    allow_zero: bool = True,
+    inclusive: bool | None = None,
+    allow_negative: bool = False,
+    deduplicate: bool = True,
+) -> list[int]:
+    """Parse a comma- or whitespace-separated string into a validated list of integers."""
+    is_inclusive = inclusive if inclusive is not None else allow_zero
+    floats = parse_float_grid(
+        raw,
+        name=name,
+        min_val=float(min_val) if min_val is not None else None,
+        inclusive=is_inclusive,
+        allow_negative=allow_negative,
+        deduplicate=deduplicate,
+    )
+    for val in floats:
+        if not val.is_integer():
+            raise ValueError(f"Values in {name} must be integers, got {val}.")
+    return [int(val) for val in floats]
+
+
+NON_OPTIMIZER_HPARAMS: frozenset[str] = frozenset(
+    {"batch_size", "max_grad_norm", "epochs", "max_steps"}
+)
 
 
 @dataclass(frozen=True)
@@ -228,6 +263,14 @@ class HyperparameterGrid:
             keys.append(key)
             value_lists.append(vals)
 
+        total_combinations = math.prod(len(v) for v in value_lists) if value_lists else 0
+        max_allowed_trials = 100_000
+        if total_combinations > max_allowed_trials:
+            raise ValueError(
+                f"Search space produces {total_combinations:,} trials, "
+                f"exceeding maximum permitted safety bound ({max_allowed_trials:,})."
+            )
+
         self._trials: tuple[TrialConfig, ...] = tuple(
             TrialConfig(trial_id=i, params=dict(zip(keys, combo, strict=True)))
             for i, combo in enumerate(itertools.product(*value_lists))
@@ -296,16 +339,22 @@ class _RankRNGState:
 
     @classmethod
     def capture(cls, device_type: str = "cpu") -> _RankRNGState:
-        capture_cuda = (
-            torch.device(device_type).type == "cuda"
-            and torch.cuda.is_available()
-            and torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+        capture_cuda = torch.device(device_type).type == "cuda" and torch.cuda.is_available()
+        if capture_cuda and not torch.cuda.is_initialized():  # type: ignore[no-untyped-call]
+            try:
+                torch.cuda.init()  # type: ignore[no-untyped-call]
+            except Exception:
+                pass
+        cuda_states = (
+            torch.cuda.get_rng_state_all()
+            if capture_cuda and torch.cuda.is_initialized()  # type: ignore[no-untyped-call]
+            else None
         )
         return cls(
             py_state=random.getstate(),
             np_state=np.random.get_state(),
             cpu_state=torch.get_rng_state(),
-            cuda_states=torch.cuda.get_rng_state_all() if capture_cuda else None,
+            cuda_states=cuda_states,
         )
 
     def restore(self) -> None:
@@ -437,12 +486,40 @@ class VirtualGridSearch:
             return True
         return candidate > reference if self.higher_is_better else candidate < reference
 
+    @overload
     @staticmethod
     def _forward_and_loss(
         model: nn.Module,
         batch: Any,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_logits: Literal[True] = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+    @overload
+    @staticmethod
+    def _forward_and_loss(
+        model: nn.Module,
+        batch: Any,
+        device: torch.device,
+        return_logits: Literal[False],
+    ) -> tuple[torch.Tensor, None, None]: ...
+
+    @overload
+    @staticmethod
+    def _forward_and_loss(
+        model: nn.Module,
+        batch: Any,
+        device: torch.device,
+        return_logits: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]: ...
+
+    @staticmethod
+    def _forward_and_loss(
+        model: nn.Module,
+        batch: Any,
+        device: torch.device,
+        return_logits: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """Run forward pass on a mapping or `(inputs, labels)` batch and return `(loss, logits_cpu, labels_cpu)`."""
         if isinstance(batch, Mapping):
             device_batch = {
@@ -476,6 +553,9 @@ class VirtualGridSearch:
 
         if loss.ndim > 0:
             loss = loss.mean()
+
+        if not return_logits:
+            return loss, None, None
 
         return loss, logits.detach().cpu(), labels.detach().cpu()
 
@@ -556,34 +636,50 @@ class VirtualGridSearch:
         self, wave: WaveSchedule, target_device: torch.device
     ) -> dict[int, _ActiveTrialState]:
         states: dict[int, _ActiveTrialState] = {}
-        for rank in wave.active_ranks:
-            trial = wave.rank_to_trial[rank]
-            seed_everything(self.seed)
-            replica = copy.deepcopy(self._base_model_template).to(target_device)
-            replica.load_state_dict(self._initial_state_dict)
-            replica.train()
-            optimizer = self.optimizer_cls(replica.parameters(), **trial.params)
-            scaler = AmpGradScalerState(
-                device_type=self.grid.device_type,
-                ranks=[rank],
-                amp_dtype=self.amp_dtype,
-            )
-            states[rank] = _ActiveTrialState(
-                rank=rank,
-                trial=trial,
-                replica=replica,
-                optimizer=optimizer,
-                scaler=scaler,
-                rng=_RankRNGState.capture(self.grid.device_type),
-            )
-        return states
+        try:
+            for rank in wave.active_ranks:
+                trial = wave.rank_to_trial[rank]
+                seed_everything(self.seed)
+                replica = copy.deepcopy(self._base_model_template).to(target_device)
+                replica.load_state_dict(self._initial_state_dict)
+                replica.train()
+                opt_kwargs = {
+                    k: v for k, v in trial.params.items() if k not in NON_OPTIMIZER_HPARAMS
+                }
+                optimizer = self.optimizer_cls(replica.parameters(), **opt_kwargs)
+                scaler = AmpGradScalerState(
+                    device_type=self.grid.device_type,
+                    ranks=[rank],
+                    amp_dtype=self.amp_dtype,
+                )
+                states[rank] = _ActiveTrialState(
+                    rank=rank,
+                    trial=trial,
+                    replica=replica,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    rng=_RankRNGState.capture(self.grid.device_type),
+                )
+            return states
+        except BaseException:
+            for s in states.values():
+                s.optimizer.zero_grad(set_to_none=True)
+                s.optimizer.state.clear()
+                s.replica.to("cpu")
+            states.clear()
+            gc.collect()
+            if target_device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
 
     def _train_step_rank(
         self, state: _ActiveTrialState, batch: Any, target_device: torch.device
     ) -> None:
         state.optimizer.zero_grad(set_to_none=True)
         with state.scaler.autocast_context():
-            loss, _, _ = self._forward_and_loss(state.replica, batch, target_device)
+            loss, _, _ = self._forward_and_loss(
+                state.replica, batch, target_device, return_logits=False
+            )
         state.scaler.backward(state.rank, loss)
         is_finite = state.scaler.unscale_and_check_finite({state.rank: state.replica.parameters()})
 
@@ -595,8 +691,9 @@ class VirtualGridSearch:
                     neginf=-ROCM_GRAD_FINITE_BOUND,
                 )
 
-        if is_finite and self.max_grad_norm is not None and self.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(state.replica.parameters(), self.max_grad_norm)
+        effective_max_grad_norm = state.trial.params.get("max_grad_norm", self.max_grad_norm)
+        if is_finite and effective_max_grad_norm is not None and effective_max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(state.replica.parameters(), effective_max_grad_norm)
 
         state.scaler.step_optimizers(
             {state.rank: state.optimizer},
@@ -663,47 +760,64 @@ class VirtualGridSearch:
                     for rank in wave.active_ranks:
                         gen = torch.Generator()
                         gen.manual_seed(self.seed + epoch)
+                        trial_bs = int(
+                            wave.rank_to_trial[rank].params.get("batch_size", batch_size)
+                        )
                         loader: DataLoader[Any] = DataLoader(
                             train_dataset,
-                            batch_size=batch_size,
+                            batch_size=trial_bs,
                             shuffle=True,
                             generator=gen,
                         )
                         rank_iters[rank] = iter(loader)
 
-                    step = 0
-                    while not has_max_steps or (max_steps is not None and step < max_steps):
+                    active_ranks = set(wave.active_ranks)
+                    rank_step_counts = {r: 0 for r in wave.active_ranks}
+
+                    while active_ranks:
                         batches: dict[int, Any] = {}
-                        exhausted = False
-                        for rank in wave.active_ranks:
+                        exhausted_ranks: list[int] = []
+
+                        ordered_active = [r for r in wave.active_ranks if r in active_ranks]
+                        for rank in ordered_active:
+                            if (
+                                has_max_steps
+                                and max_steps is not None
+                                and rank_step_counts[rank] >= max_steps
+                            ):
+                                active_ranks.remove(rank)
+                                continue
                             state = states[rank]
                             state.rng.restore()
                             try:
                                 batches[rank] = next(rank_iters[rank])
                             except StopIteration:
-                                exhausted = True
+                                exhausted_ranks.append(rank)
                             finally:
                                 state.rng = _RankRNGState.capture(self.grid.device_type)
-                            if exhausted:
-                                break
-                        if exhausted:
-                            break
 
-                        step += 1
-                        for rank in wave.active_ranks:
+                        for rank in exhausted_ranks:
+                            active_ranks.discard(rank)
+
+                        for rank in [r for r in wave.active_ranks if r in batches]:
+                            batch = batches[rank]
                             state = states[rank]
                             state.rng.restore()
-                            self._train_step_rank(state, batches[rank], target_device)
+                            self._train_step_rank(state, batch, target_device)
                             state.rng = _RankRNGState.capture(self.grid.device_type)
+                            rank_step_counts[rank] += 1
+
+                    rank_iters.clear()
 
                     for rank in wave.active_ranks:
                         state = states[rank]
                         state.rng.restore()
+                        trial_eval_bs = int(state.trial.params.get("batch_size", batch_size))
                         try:
                             metrics_dict = self._evaluate_replica(
                                 state=state,
                                 eval_dataset=val_dataset,
-                                batch_size=batch_size,
+                                batch_size=trial_eval_bs,
                                 device=target_device,
                                 average=average,
                                 eval_fn=eval_fn,

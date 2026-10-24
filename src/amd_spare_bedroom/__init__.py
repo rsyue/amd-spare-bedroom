@@ -28,6 +28,7 @@ from amd_spare_bedroom.grid_search import (
     VirtualGridSearch,
     WaveSchedule,
     parse_float_grid,
+    parse_int_grid,
 )
 from amd_spare_bedroom.metrics import (
     ClassificationMetrics,
@@ -69,6 +70,7 @@ __all__ = [
     "evaluate_causal_lm_model",
     "evaluate_classification_epoch",
     "parse_float_grid",
+    "parse_int_grid",
     "resolve_amp_dtype",
     "seed_everything",
 ]

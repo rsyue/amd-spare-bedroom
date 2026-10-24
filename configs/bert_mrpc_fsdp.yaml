@@ -1,0 +1,31 @@
+# BERT Sequence Classification on GLUE MRPC using VirtualFSDP (Sharded)
+grid:
+  ranks: 4
+  total_vram_gb: 96.0
+  device: auto
+  seed: 42
+
+training:
+  epochs: 3
+  batch_size: 8
+  lr: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  max_steps: 0
+  amp: bf16
+
+model:
+  model_name: bert-base-uncased
+  use_tiny: false
+  max_seq_length: 128
+
+data:
+  task_name: mrpc
+  synthetic: false
+
+parallelism:
+  mode: fsdp
+
+checkpoint:
+  checkpoint_dir: checkpoints/best_bert_mrpc_fsdp
+  eval_metric: f1

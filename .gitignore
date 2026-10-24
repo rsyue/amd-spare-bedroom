@@ -54,3 +54,10 @@ dmypy.json
 .scratch/
 scratch/
 tmp/
+checkpoints/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
