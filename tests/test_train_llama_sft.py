@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Sized
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -550,3 +551,43 @@ def test_cli_standalone_execution() -> None:
     )
     assert result.returncode == 0
     assert "Supervised Fine-Tuning (SFT) on Llama 3.2 1B" in result.stdout
+
+
+def test_main_grid_search_with_batch_size_1_and_max_steps_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify that launching Llama grid search with batch size 1 and max_steps 0 succeeds end-to-end."""
+    ckpt_dir = tmp_path / "ckpt_llama_bs1"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "train_llama_sft.py",
+            "--grid-search",
+            "--lr-grid",
+            "1e-4",
+            "--weight-decay-grid",
+            "0.0",
+            "--batch-size-grid",
+            "1,2",
+            "--ranks",
+            "2",
+            "--synthetic",
+            "--use-tiny-llama",
+            "--dataset-size",
+            "4",
+            "--max-seq-length",
+            "16",
+            "--epochs",
+            "1",
+            "--max-steps",
+            "0",  # Full epoch
+            "--device",
+            "cpu",
+            "--checkpoint-dir",
+            str(ckpt_dir),
+        ],
+    )
+    main()
+    out = capsys.readouterr().out
+    assert "Grid search completed 2 trials in 1 wave(s)." in out
+    assert (ckpt_dir / "model.safetensors").is_file()

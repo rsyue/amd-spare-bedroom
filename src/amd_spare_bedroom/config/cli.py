@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from amd_spare_bedroom.config.env import load_dotenv
-from amd_spare_bedroom.config.settings import ExperimentConfig, load_config
+from amd_spare_bedroom.config.settings import ExperimentConfig
 
 
 def add_config_argument(parser: argparse.ArgumentParser) -> None:
@@ -59,16 +59,19 @@ def parse_args_with_config(
     known, _ = pre_parser.parse_known_args(args)
 
     if known.config:
-        config_path = Path(known.config)
+        config_path = Path(known.config).expanduser().resolve()
         try:
-            exp_config: ExperimentConfig = load_config(config_path)
+            if not config_path.is_file():
+                raise FileNotFoundError(f"Configuration file not found: {config_path}")
             raw_text = config_path.read_text(encoding="utf-8")
             raw_yaml = yaml.safe_load(raw_text) or {}
+            if not isinstance(raw_yaml, dict):
+                raise ValueError(
+                    f"Configuration file '{config_path}' must define a YAML mapping/dictionary."
+                )
+            exp_config: ExperimentConfig = ExperimentConfig.from_dict(raw_yaml)
         except Exception as exc:
             parser.error(f"Error loading configuration file '{known.config}': {exc}")
-
-        if not isinstance(raw_yaml, dict):
-            raw_yaml = {}
 
         explicit_keys: set[str] = set()
         for k, v in raw_yaml.items():
@@ -100,24 +103,14 @@ def parse_args_with_config(
 
         flat_defaults = exp_config.to_flat_dict()
 
-        # Handle grid search params mapping if specified
+        # Handle grid search params mapping dynamically
         if exp_config.grid_search.params:
-            if "lr" in exp_config.grid_search.params:
-                flat_defaults["lr_grid"] = ",".join(
-                    str(x) for x in exp_config.grid_search.params["lr"]
-                )
-            if "weight_decay" in exp_config.grid_search.params:
-                flat_defaults["weight_decay_grid"] = ",".join(
-                    str(x) for x in exp_config.grid_search.params["weight_decay"]
-                )
-            if "batch_size" in exp_config.grid_search.params:
-                flat_defaults["batch_size_grid"] = ",".join(
-                    str(x) for x in exp_config.grid_search.params["batch_size"]
-                )
-            if "max_grad_norm" in exp_config.grid_search.params:
-                flat_defaults["max_grad_norm_grid"] = ",".join(
-                    str(x) for x in exp_config.grid_search.params["max_grad_norm"]
-                )
+            for p_k, p_v in exp_config.grid_search.params.items():
+                p_grid_key = f"{str(p_k).replace('-', '_')}_grid"
+                if isinstance(p_v, (list, tuple)):
+                    flat_defaults[p_grid_key] = ",".join(str(x) for x in p_v)
+                else:
+                    flat_defaults[p_grid_key] = str(p_v)
 
         # Match flat defaults to parser actions by destination attribute name
         known_dests = {action.dest for action in parser._actions}
@@ -129,23 +122,10 @@ def parse_args_with_config(
             if "use_tiny_llama" in known_dests:
                 flat_defaults["use_tiny_llama"] = flat_defaults["use_tiny"]
 
-        # Propagate alias destinations if present
-        if "task_name" in flat_defaults and "task" in known_dests:
-            flat_defaults["task"] = flat_defaults["task_name"]
-        if "max_seq_length" in flat_defaults:
-            if "seq_len" in known_dests:
-                flat_defaults["seq_len"] = flat_defaults["max_seq_length"]
-            if "max_seq_len" in known_dests:
-                flat_defaults["max_seq_len"] = flat_defaults["max_seq_length"]
-        if "checkpoint_dir" in flat_defaults and "checkpoint_path" in known_dests:
-            flat_defaults["checkpoint_path"] = flat_defaults["checkpoint_dir"]
-        if "synthetic" in flat_defaults and "use_synthetic" in known_dests:
-            flat_defaults["use_synthetic"] = flat_defaults["synthetic"]
-
         valid_defaults: dict[str, Any] = {}
         for k, v in flat_defaults.items():
             normalized_key = k.replace("-", "_")
-            if normalized_key in explicit_keys and normalized_key in known_dests and v is not None:
+            if normalized_key in explicit_keys and normalized_key in known_dests:
                 valid_defaults[normalized_key] = v
 
         if valid_defaults:

@@ -24,13 +24,14 @@ class GridConfig(BaseModel):
         gt=0.0,
         description="Total physical VRAM pool budget in GB.",
     )
-    device: str = Field(
-        default_factory=lambda: get_env_str("AMD_SPARE_BEDROOM_DEVICE", "auto"),
+    device: Literal["auto", "cuda", "cpu"] = Field(
+        default_factory=lambda: get_env_str("AMD_SPARE_BEDROOM_DEVICE", "auto"),  # type: ignore[arg-type]
         description="Execution device backend ('auto', 'cuda', 'cpu').",
     )
     seed: int = Field(
         default_factory=lambda: get_env_int("AMD_SPARE_BEDROOM_SEED", 42),
         ge=0,
+        lt=2**32,
         description="Deterministic random seed.",
     )
 
@@ -128,19 +129,13 @@ FLAT_KEY_TO_SECTION: dict[str, str] = {
     "amp": "training",
     "model_name": "model",
     "use_tiny": "model",
-    "use_tiny_bert": "model",
-    "use_tiny_llama": "model",
     "max_seq_length": "model",
-    "seq_len": "model",
     "task_name": "data",
-    "task": "data",
     "dataset_name": "data",
     "dataset_size": "data",
     "synthetic": "data",
-    "use_synthetic": "data",
     "parallelism": "parallelism",
     "checkpoint_dir": "checkpoint",
-    "checkpoint_path": "checkpoint",
     "eval_metric": "checkpoint",
     "grid_search": "grid_search",
 }
@@ -170,26 +165,22 @@ class ExperimentConfig(BaseModel):
             "grid_search": {},
         }
 
-        # First copy any existing nested sections
-        for section_name in sections:
-            if section_name in data and isinstance(data[section_name], dict):
-                sections[section_name].update(data[section_name])
-
-        # Then distribute flat keys into their respective sections
-        for key, value in data.items():
+        # First distribute flat keys into their respective sections
+        for raw_key, value in data.items():
+            key = str(raw_key).replace("-", "_")
             if key in sections and isinstance(value, dict):
                 continue
 
             # Handle aliases
             if key in ("use_tiny_bert", "use_tiny_llama"):
                 sections["model"]["use_tiny"] = bool(value)
-            elif key == "seq_len":
+            elif key in ("seq_len", "max_seq_len"):
                 sections["model"]["max_seq_length"] = value
             elif key == "task":
                 sections["data"]["task_name"] = value
             elif key == "use_synthetic":
                 sections["data"]["synthetic"] = bool(value)
-            elif key == "parallelism" and isinstance(value, str):
+            elif key in ("parallelism", "mode") and isinstance(value, str):
                 sections["parallelism"]["mode"] = value
             elif key == "checkpoint_path":
                 sections["checkpoint"]["checkpoint_dir"] = value
@@ -198,6 +189,12 @@ class ExperimentConfig(BaseModel):
             elif key in FLAT_KEY_TO_SECTION:
                 target_sec = FLAT_KEY_TO_SECTION[key]
                 sections[target_sec][key] = value
+
+        # Then overlay nested sections so structured dictionaries override flat defaults
+        for section_name in sections:
+            if section_name in data and isinstance(data[section_name], dict):
+                norm_dict = {str(k).replace("-", "_"): v for k, v in data[section_name].items()}
+                sections[section_name].update(norm_dict)
 
         return cls(
             grid=GridConfig(**sections["grid"]),
@@ -264,7 +261,7 @@ def load_config(
         FileNotFoundError: If the config file does not exist.
         ValueError: If YAML parsing fails.
     """
-    file_path = Path(path).resolve()
+    file_path = Path(path).expanduser().resolve()
     if not file_path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {file_path}")
 

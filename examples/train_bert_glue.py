@@ -365,27 +365,27 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
             parsed.lr_grid,
             name="--lr-grid",
             min_val=0.0,
-            allow_zero=False,
+            inclusive=False,
         )
         parse_float_grid(
             parsed.weight_decay_grid,
             name="--weight-decay-grid",
             min_val=0.0,
-            allow_zero=True,
+            inclusive=True,
         )
         if parsed.batch_size_grid:
             parse_int_grid(
                 parsed.batch_size_grid,
                 name="--batch-size-grid",
                 min_val=1,
-                allow_zero=True,
+                inclusive=True,
             )
         if parsed.max_grad_norm_grid:
             parse_float_grid(
                 parsed.max_grad_norm_grid,
                 name="--max-grad-norm-grid",
                 min_val=0.0,
-                allow_zero=True,
+                inclusive=True,
             )
     return parsed
 
@@ -544,11 +544,11 @@ def main(argv: list[str] | None = None) -> None:
         }
         if args.batch_size_grid:
             search_space["batch_size"] = parse_int_grid(
-                args.batch_size_grid, name="--batch-size-grid", min_val=1, allow_zero=False
+                args.batch_size_grid, name="--batch-size-grid", min_val=1, inclusive=True
             )
         if args.max_grad_norm_grid:
             search_space["max_grad_norm"] = parse_float_grid(
-                args.max_grad_norm_grid, name="--max-grad-norm-grid", min_val=0.0, allow_zero=True
+                args.max_grad_norm_grid, name="--max-grad-norm-grid", min_val=0.0, inclusive=True
             )
         total_trials = math.prod(len(v) for v in search_space.values())
         print(
@@ -570,7 +570,7 @@ def main(argv: list[str] | None = None) -> None:
             eval_dataset=eval_dataset,
             batch_size=args.batch_size,
             epochs=args.epochs,
-            max_steps=args.max_steps,
+            max_steps=args.max_steps if args.max_steps > 0 else None,
         )
         print(
             f"[*] Grid search completed {len(result.trials)} trials in {result.num_waves} wave(s)."

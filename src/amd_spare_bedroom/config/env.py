@@ -75,7 +75,13 @@ def find_dotenv(
     or the filesystem root.
     """
     filename_path = Path(filename)
-    if filename_path.is_absolute() or len(filename_path.parts) > 1:
+    if (
+        not filename
+        or filename in (".", "..")
+        or filename_path.name != filename
+        or filename_path.is_absolute()
+        or len(filename_path.parts) > 1
+    ):
         raise ValueError(f"filename must be a plain filename, got: {filename!r}")
 
     current = Path(start_dir).resolve() if start_dir is not None else Path.cwd().resolve()
@@ -101,13 +107,13 @@ def load_dotenv(
     Returns:
         Dictionary of parsed key-value pairs from the .env file.
     """
-    target_path = Path(path).resolve() if path is not None else find_dotenv()
+    target_path = Path(path).expanduser().resolve() if path is not None else find_dotenv()
     if target_path is None or not target_path.is_file():
         return {}
 
     try:
         content = target_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return {}
 
     parsed = parse_dotenv_content(content)

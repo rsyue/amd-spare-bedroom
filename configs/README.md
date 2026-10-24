@@ -105,7 +105,7 @@ Configurations can be authored using either **nested sections** (e.g. `grid.rank
 | `training.weight_decay` (`weight_decay`) | `--weight-decay` | - | `float` | `0.01` | Weight decay regularization for AdamW. |
 | `training.max_grad_norm` (`max_grad_norm`) | `--max-grad-norm` | - | `float \| null` | `1.0` | Maximum gradient norm threshold for clipping (`<= 0` to disable). |
 | `training.max_steps` (`max_steps`) | `--max-steps` | - | `int` | `5` | Maximum training steps per epoch (`<= 0` for full epoch). |
-| `training.amp` (`amp`) | `--amp`, `--precision` | - | `str` | `"none"` (CPU) / `"bf16"` (GPU) | Automatic mixed precision (`"none"`, `"bf16"`, `"fp16"`). |
+| `training.amp` (`amp`) | `--amp`, `--precision` | - | `str` | `"none"` | Automatic mixed precision (`"none"`, `"bf16"`, `"fp16"`). |
 
 ### 5. Parallelism Mode
 

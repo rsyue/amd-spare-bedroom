@@ -169,3 +169,50 @@ def test_cli_config_error_handling(tmp_path: Path) -> None:
     corrupt_file.write_text("invalid: yaml: [", encoding="utf-8")
     with pytest.raises(SystemExit):
         parse_args_with_config(parser, ["--config", str(corrupt_file)])
+
+
+def test_cli_explicit_null_override(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "null_override.yaml"
+    yaml_file.write_text(
+        """
+        training:
+          max_grad_norm: null
+        checkpoint:
+          checkpoint_dir: null
+        """,
+        encoding="utf-8",
+    )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/default")
+
+    args = parse_args_with_config(parser, ["--config", str(yaml_file)])
+    assert args.max_grad_norm is None
+    assert args.checkpoint_dir is None
+
+
+def test_cli_dynamic_grid_search_params(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "dynamic_grid.yaml"
+    yaml_file.write_text(
+        """
+        grid_search:
+          enabled: true
+          params:
+            lr: [1e-4, 5e-5]
+            dropout: [0.1, 0.2]
+        """,
+        encoding="utf-8",
+    )
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--grid-search", action="store_true")
+    parser.add_argument("--lr-grid", type=str, default="1e-5")
+    parser.add_argument("--dropout-grid", type=str, default="0.0")
+
+    args = parse_args_with_config(parser, ["--config", str(yaml_file)])
+    assert args.grid_search is True
+    assert (
+        args.lr_grid == "0.0001,5e-05" or args.lr_grid == "0.0001, 5e-05" or "1e-4" in args.lr_grid
+    )
+    assert args.dropout_grid == "0.1,0.2"

@@ -237,6 +237,7 @@ In accordance with our [TDD Guidelines](AGENTS.md), development proceeds in vert
 - **Seam 10: Multi-Rank Hyperparameter Grid Search Execution Engine (`VirtualGridSearch`, `TrialResult`, `GridSearchResult`)**: Per-rank replica and optimizer isolation, lockstep wave execution with step limits, evaluation aggregation, and single-best safetensors checkpointing.
 - **Seam 11: CLI Hyperparameter Grid Search & Winner Announcement (`--grid-search`, `format_winner_announcement`)**: Multi-rank wave execution orchestration from CLI, single best-model safetensors persistence, and canonical final-line winner announcement format.
 - **Seam 12: Causal LM SFT Pipeline & Next-Token Metrics (`SFTMetrics`, `evaluate_causal_lm_epoch`)**: Instruction fine-tuning for Llama 3.2 1B, Alpaca label masking (`ignore_index=-100`), validation perplexity, and masked token accuracy.
+- **Seam 13: Configuration Schemas, Environment Abstraction & CLI Overrides (`ExperimentConfig`, `load_config`, `parse_args_with_config`, `load_dotenv`)**: Encapsulated configuration management in `amd_spare_bedroom.config`, Pydantic validation, hierarchical `.env` fallbacks, selective CLI defaults propagation, and declarative YAML experiment recipes.
 
 ---
 

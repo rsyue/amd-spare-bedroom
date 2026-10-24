@@ -200,3 +200,36 @@ def test_grid_config_env_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
     assert grid.total_vram_gb == 48.0
     assert grid.device == "cpu"
     assert grid.seed == 123
+
+
+def test_hyphenated_yaml_keys_mapping() -> None:
+    data = {
+        "batch-size": 16,
+        "task-name": "sst2",
+        "max-seq-length": 64,
+        "total-vram-gb": 32.0,
+    }
+    cfg = ExperimentConfig.from_dict(data)
+    assert cfg.training.batch_size == 16
+    assert cfg.data.task_name == "sst2"
+    assert cfg.model.max_seq_length == 64
+    assert cfg.grid.total_vram_gb == 32.0
+
+
+def test_grid_config_bounds() -> None:
+    with pytest.raises(ValidationError):
+        # seed must be < 2**32
+        GridConfig(seed=2**35)
+
+    with pytest.raises(ValidationError):
+        # device must be auto, cuda, or cpu
+        GridConfig(device="unsupported_device")  # type: ignore[arg-type]
+
+
+def test_load_config_expands_user_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg_file = tmp_path / "user_cfg.yaml"
+    cfg_file.write_text("training:\n  epochs: 7\n", encoding="utf-8")
+
+    cfg = load_config("~/user_cfg.yaml")
+    assert cfg.training.epochs == 7

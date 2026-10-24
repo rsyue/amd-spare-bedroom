@@ -139,6 +139,19 @@ def test_find_dotenv_invalid_filename() -> None:
     with pytest.raises(ValueError, match="plain filename"):
         find_dotenv(filename="../secret.env")
 
+    with pytest.raises(ValueError, match="plain filename"):
+        find_dotenv(filename=".")
+
+    with pytest.raises(ValueError, match="plain filename"):
+        find_dotenv(filename="..")
+
+
+def test_load_dotenv_unicode_decode_error(tmp_path: Path) -> None:
+    bad_file = tmp_path / ".env"
+    bad_file.write_bytes(b"\xff\xfe\x00\x00")
+    result = load_dotenv(bad_file)
+    assert result == {}
+
 
 def test_find_dotenv_stops_at_repo_boundary(tmp_path: Path) -> None:
     outer_env = tmp_path / ".env"
