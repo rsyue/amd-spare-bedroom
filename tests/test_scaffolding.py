@@ -9,5 +9,5 @@ def test_package_version() -> None:
 
 
 def test_package_license() -> None:
-    """Verify package license is set to CC-BY-NC-ND-4.0."""
-    assert amd_spare_bedroom.__license__ == "CC-BY-NC-ND-4.0"
+    """Verify package license is set to MIT."""
+    assert amd_spare_bedroom.__license__ == "MIT"
