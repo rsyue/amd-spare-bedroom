@@ -99,7 +99,7 @@ flowchart LR
 ## Getting Started
 
 ### 1. Prerequisites
-- **Python**: `>=3.12`
+- **Python**: `==3.12.*`
 - **Environment Manager**: [`uv`](https://github.com/astral-sh/uv)
 - **Target Hardware**: AMD ROCm GPU (initial target: `gfx_1151` / RDNA 3.5 / Radeon 8060S with unified VRAM)
 
@@ -111,7 +111,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 
 # Install dependencies with official AMD ROCm nightly index (pre-configured in pyproject.toml):
-uv sync --extra dev
+uv sync
 
 # Copy environment template:
 cp .env.example .env

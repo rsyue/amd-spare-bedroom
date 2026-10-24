@@ -107,6 +107,9 @@ Some repositories maintain a directory of custom bash wrapper scripts (e.g., `./
 ```yaml
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ "main", "master" ]
@@ -114,7 +117,7 @@ on:
     branches: [ "main", "master" ]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -130,16 +133,17 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: "lint"
+          prune-cache: true
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --locked
+        run: uv sync --locked --only-group dev --no-install-project
 
       - name: Run Ruff Lint (with GitHub PR Annotations)
-        run: uv run --locked ruff check --output-format=github .
+        run: uv run --locked --no-sync ruff check --output-format=github .
 
       - name: Verify Ruff Code Formatting
-        run: uv run --locked ruff format --check .
+        run: uv run --locked --no-sync ruff format --check .
 
   typecheck:
     name: Typecheck (Mypy)
@@ -153,6 +157,7 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: "typecheck"
+          prune-cache: true
           python-version: "3.12"
 
       - name: Install dependencies
@@ -173,6 +178,7 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: "test"
+          prune-cache: true
           python-version: "3.12"
 
       - name: Install dependencies

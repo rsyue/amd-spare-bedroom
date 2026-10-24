@@ -10,16 +10,16 @@ Run any pre-built experiment recipe with `uv run`:
 
 ```bash
 # 1. BERT Sequence Classification on MRPC with VirtualDDP
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml
 
 # 2. BERT Sequence Classification on MRPC with VirtualFSDP
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml
 
 # 3. Llama 3.2 1B Instruction Fine-Tuning with VirtualFSDP
-uv run examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml
+uv run python examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml
 
 # 4. Multi-Rank Hyperparameter Grid Search for BERT
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_grid.yaml
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_grid.yaml
 ```
 
 ### Overriding Parameters from CLI
@@ -28,10 +28,10 @@ Any parameter defined in a YAML configuration file can be overridden on the comm
 
 ```bash
 # Override batch size and learning rate on top of the bert_mrpc_ddp config:
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml --batch-size 16 --lr 5e-5
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml --batch-size 16 --lr 5e-5
 
 # Override number of epochs and target device:
-uv run examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml --epochs 1 --device cuda
+uv run python examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml --epochs 1 --device cuda
 ```
 
 ---
@@ -165,5 +165,5 @@ checkpoint:
 Run it directly with:
 
 ```bash
-uv run examples/train_bert_glue.py --config configs/my_custom_experiment.yaml
+uv run python examples/train_bert_glue.py --config configs/my_custom_experiment.yaml
 ```
