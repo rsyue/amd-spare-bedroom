@@ -42,7 +42,7 @@ from amd_spare_bedroom.metrics import (
 from amd_spare_bedroom.sampler import VirtualRankSampler
 
 __version__ = "0.1.0"
-__license__ = "CC-BY-NC-ND-4.0"
+__license__ = "MIT"
 
 __all__ = [
     "AmpGradScalerState",
