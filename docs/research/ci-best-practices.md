@@ -42,9 +42,11 @@ Professional Python libraries structure CI into discrete parallel jobs:
 #### Ruff (Linting & Formatting)
 * **Execution:** Run both linter and formatter verification:
   ```bash
-  uv run --locked ruff check --output-format=github .
-  uv run --locked ruff format --check .
+  uv sync --locked --only-group dev --no-install-project
+  uv run --locked --no-sync ruff check --output-format=github .
+  uv run --locked --no-sync ruff format --check .
   ```
+* **Dependency Minimization:** Ruff is a standalone Rust binary that does not depend on project runtime dependencies or heavy PyTorch/ROCm wheels. Synchronizing only `--only-group dev --no-install-project` speeds up CI runner setup and eliminates network vulnerability to external wheel registries.
 * **GitHub Annotations:** The `--output-format=github` flag outputs workflow command syntax (`::error file=...`), creating native inline code annotations directly on GitHub PR diffs ([Ruff Docs: Output Formats](https://docs.astral.sh/ruff/configuration/#output-format)).
 
 #### Mypy (Static Type Checking)
@@ -69,11 +71,11 @@ Professional Python libraries structure CI into discrete parallel jobs:
 * **Safe Concurrency Pattern:**
   ```yaml
   concurrency:
-    group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
     cancel-in-progress: true
   ```
-  * For **Pull Requests**: `github.head_ref` evaluates to the PR branch name. If a developer pushes three commits in rapid succession, obsolete runs are automatically cancelled, saving runner minutes.
-  * For **Main Branch Pushes**: `github.head_ref` is empty, falling back to `github.run_id` (globally unique). Pushes and merge commits to `main` will *never* cancel each other and will always complete.
+  * For **Pull Requests**: `github.event.pull_request.number` evaluates to the unique PR number. If a developer pushes three commits in rapid succession, obsolete runs are automatically cancelled, saving runner minutes. Keying on PR number avoids collision across external forks with common branch names (such as `main` or `patch-1`).
+  * For **Main Branch Pushes**: `github.event.pull_request.number` is empty, falling back to `github.run_id` (globally unique). Pushes and merge commits to `main` will *never* cancel each other and will always complete.
 
 ---
 

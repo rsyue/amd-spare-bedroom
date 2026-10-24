@@ -127,16 +127,16 @@ Experiments can be executed using pre-built YAML configurations in [`configs/`](
 
 ```bash
 # BERT sequence classification on MRPC using replicated VirtualDDP (4 ranks):
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml
 
 # BERT sequence classification on MRPC using sharded VirtualFSDP (4 ranks):
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml
 
 # Llama 3.2 1B instruction fine-tuning using sharded VirtualFSDP (4 ranks):
-uv run examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml
+uv run python examples/train_llama_sft.py --config configs/llama_sft_fsdp.yaml
 
 # Multi-rank hyperparameter grid search across LR, weight decay, and batch size:
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_grid.yaml
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_grid.yaml
 ```
 
 ### 2. Command-Line Overrides
@@ -145,20 +145,20 @@ Override any configuration parameter on the fly without editing YAML files:
 
 ```bash
 # Override batch size and learning rate:
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml --batch-size 16 --lr 5e-5
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_ddp.yaml --batch-size 16 --lr 5e-5
 
 # Evaluate across 8 virtual ranks on SST-2:
-uv run examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml --ranks 8 --task-name sst2
+uv run python examples/train_bert_glue.py --config configs/bert_mrpc_fsdp.yaml --ranks 8 --task-name sst2
 ```
 
 ### 3. Fast Local Smoke Tests (Offline / No Model Downloads)
 
 ```bash
 # BERT classification smoke test with compact 2-layer model and synthetic data:
-uv run examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
+uv run python examples/train_bert_glue.py --synthetic --use-tiny-bert --ranks 2 --max-steps 2
 
 # Llama 3.2 1B SFT smoke test with compact 2-layer model and synthetic data:
-uv run examples/train_llama_sft.py --synthetic --use-tiny-llama --ranks 2 --max-steps 2
+uv run python examples/train_llama_sft.py --synthetic --use-tiny-llama --ranks 2 --max-steps 2
 ```
 
 For complete documentation on all configuration options, YAML schemas, environment variables, and CLI flags, consult [`configs/README.md`](configs/README.md).
@@ -167,7 +167,7 @@ For complete documentation on all configuration options, YAML schemas, environme
 
 ## Contributing & Development
 
-For local quality assurance commands (`ruff`, `mypy`, `pytest`), architectural seams (Seams 1–13), and pull request guidelines, please refer to [**`CONTRIBUTING.md`**](CONTRIBUTING.md) (or [**`CONTRIB.md`**](CONTRIB.md)).
+For local quality assurance commands (`ruff`, `mypy`, `pytest`), architectural seams (Seams 1–13), and pull request guidelines, please refer to [**`CONTRIBUTING.md`**](CONTRIBUTING.md).
 
 ---
 
